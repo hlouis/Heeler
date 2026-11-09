@@ -99,6 +99,9 @@ struct TerminalListView: View {
             }
             .listStyle(.insetGrouped)
             .listSectionSpacing(.compact)
+            // The sidebar's own fill behind the cards, as By Host shows.
+            .scrollContentBackground(.hidden)
+            .background(isSidebarColumn ? .clear : Color(uiColor: .systemGroupedBackground))
             .modifier(ConsoleSidebarListTint())
             .searchDrawerStartsTucked()
         }
