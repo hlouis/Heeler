@@ -159,6 +159,7 @@ struct ConsoleView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.themeAppearance) private var themeAppearance
+    @Environment(\.themeColors) private var themeColors
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.sceneWindow) private var sceneWindow
@@ -1468,11 +1469,6 @@ struct ConsoleView: View {
                     .showSidebar()
             }
         }
-    }
-
-    /// The terminal theme of this appearance, for the surfaces it reaches.
-    private var themeColors: ThemeColors {
-        ThemeColors(themes: terminal.themes, appearance: themeAppearance)
     }
 
     /// The chrome scheme of the terminal the detail shows, if any.
