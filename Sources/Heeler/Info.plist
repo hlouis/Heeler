@@ -35,6 +35,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>HeelerAppGroup</key>
+	<string>$(HEELER_APP_GROUP)</string>
 	<key>HeelerSourceRevision</key>
 	<string>$(HEELER_SOURCE_REVISION)</string>
 	<key>NSBonjourServices</key>

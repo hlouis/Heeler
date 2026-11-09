@@ -33,6 +33,12 @@ and every `make` build target regenerates it. CI builds the *committed*
 `Heeler.xcodeproj`, so commit the regenerated project alongside any
 `project.yml` change.
 
+To install on your own device under your own Apple team, create
+`Config/Local.xcconfig` (gitignored) with `DEVELOPMENT_TEAM` and
+`HEELER_BUNDLE_ID_PREFIX`; the bundle IDs and the App Group follow the prefix
+(`Config/Base.xcconfig`). Notifications through the public Push Relay reach
+only the published bundle ID, so such a build needs its own relay for them.
+
 - `make test` — the full app suite plus the `Packages/HeelerSSH` and
   `Packages/HeelerOverlay` package suites (run through their package test
   scripts, not `-only-testing`).

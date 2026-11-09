@@ -34,8 +34,17 @@ enum NotificationKeyStoreError: Error, Equatable {
 struct NotificationKeyStore: Sendable {
     /// The app-group id doubling as the Keychain access group (iOS accepts
     /// app groups in `kSecAttrAccessGroup` without the team prefix), granted
-    /// to the app and the service extension by their entitlements.
-    static let sharedAccessGroup = "group.dev.bybee.heeler.shared"
+    /// to the app and both extensions by their entitlements. Each bundle's
+    /// Info.plist carries it as `HeelerAppGroup`, from the `HEELER_APP_GROUP`
+    /// build setting in `Config/Base.xcconfig`.
+    static let sharedAccessGroup: String = {
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "HeelerAppGroup") as? String,
+              !group.isEmpty
+        else {
+            fatalError("Info.plist lacks HeelerAppGroup; see Config/Base.xcconfig")
+        }
+        return group
+    }()
 
     private static let service = "dev.bybee.heeler.notifications"
     private static let keyBytes = 32

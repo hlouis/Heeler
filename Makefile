@@ -11,7 +11,9 @@ ARCHIVE := build/Heeler.xcarchive
 DERIVED_DEVICE ?= build/DerivedData-device
 DERIVED_SIMULATOR ?= build/DerivedData-simulator
 DERIVED ?= $(DERIVED_DEVICE)
-APP_ID  := dev.bybee.heeler
+# The built app's bundle ID, read when the recipe runs; Config/Local.xcconfig
+# may change its prefix. $(1) is the products directory.
+APP_ID = $$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' '$(1)/Heeler.app/Info.plist')
 SIM     ?= iPhone 17
 SIM_IPAD ?= iPad Pro 13-inch (M5)
 SIM_DESTINATION ?= platform=iOS Simulator,name=$(SIM)
@@ -188,7 +190,8 @@ build-device: check-device generate
 install: build-device ## Build Debug, install on the iPhone, and relaunch it
 	xcrun devicectl device install app --device $(DEVICE) \
 		$(DERIVED)/Build/Products/Debug-iphoneos/Heeler.app
-	xcrun devicectl device process launch --terminate-existing --device $(DEVICE) $(APP_ID) \
+	xcrun devicectl device process launch --terminate-existing --device $(DEVICE) \
+		"$(call APP_ID,$(DERIVED)/Build/Products/Debug-iphoneos)" \
 		|| echo "Installed, but the launch was refused (device locked?). Unlock it and open Heeler."
 
 check-device-ipad:
@@ -216,7 +219,8 @@ sim: generate ## Build Debug and run it on the simulator (override with SIM=<nam
 	xcrun simctl boot '$(SIM)' 2>/dev/null || true
 	open -a Simulator
 	xcrun simctl install booted $(DERIVED)/Build/Products/Debug-iphonesimulator/Heeler.app
-	xcrun simctl launch --terminate-running-process booted $(APP_ID)
+	xcrun simctl launch --terminate-running-process booted \
+		"$(call APP_ID,$(DERIVED)/Build/Products/Debug-iphonesimulator)"
 
 sim-ipad: ## Build Debug and run it on the iPad simulator (override with SIM_IPAD=<name>)
 	$(MAKE) sim SIM='$(SIM_IPAD)'
@@ -236,7 +240,8 @@ sim-id: build-sim ## Install and launch the app on SIMULATOR_UDID only
 	xcrun simctl boot '$(SIMULATOR_UDID)' 2>/dev/null || true
 	xcrun simctl bootstatus '$(SIMULATOR_UDID)' -b
 	xcrun simctl install '$(SIMULATOR_UDID)' $(DERIVED)/Build/Products/Debug-iphonesimulator/Heeler.app
-	xcrun simctl launch --terminate-running-process '$(SIMULATOR_UDID)' $(APP_ID)
+	xcrun simctl launch --terminate-running-process '$(SIMULATOR_UDID)' \
+		"$(call APP_ID,$(DERIVED)/Build/Products/Debug-iphonesimulator)"
 
 archive: generate ## Archive locally for inspection (no distribution upload)
 	@# HEELER_SOURCE_REVISION names the commit in About › Acknowledgements;

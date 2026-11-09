@@ -1,10 +1,14 @@
 name: Heeler
 options:
-  bundleIdPrefix: dev.bybee
   deploymentTarget:
     iOS: "18.0"
   createIntermediateGroups: true
   minimumXcodeGenVersion: "2.42.0"
+
+# Signing identity (team, bundle ID prefix, App Group) lives in the xcconfig.
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
 
 settings:
   base:
@@ -15,7 +19,6 @@ settings:
     # String Catalog at build time, so `Localizable.xcstrings` keeps its key
     # list current as code changes (String Catalog auto-extraction).
     SWIFT_EMIT_LOC_STRINGS: "YES"
-    DEVELOPMENT_TEAM: 9VM4RM39R3
     CODE_SIGN_STYLE: Automatic
 
 packages:
@@ -81,6 +84,8 @@ targets:
         # Acknowledgements (BuildSourceRevision). `make archive` and
         # release.yml set it; other builds leave it empty.
         HeelerSourceRevision: $(HEELER_SOURCE_REVISION)
+        # NotificationKeyStore.sharedAccessGroup, from Config/Base.xcconfig.
+        HeelerAppGroup: $(HEELER_APP_GROUP)
         # Without this an iPhone holds app-driven animation to 60Hz, while the
         # system keyboard next to it runs at 120Hz.
         CADisableMinimumFrameDurationOnPhone: true
@@ -113,11 +118,11 @@ targets:
         # Shared with the Notification Service Extension; doubles as the
         # Keychain access group holding the Notification Keys.
         com.apple.security.application-groups:
-          - group.dev.bybee.heeler.shared
+          - $(HEELER_APP_GROUP)
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.heeler
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEELER_BUNDLE_ID_PREFIX).heeler
         # Home-screen name; the App Store listing is "Heeler for herdr".
         INFOPLIST_KEY_CFBundleDisplayName: Heeler
         MARKETING_VERSION: "0.1.18"
@@ -190,7 +195,7 @@ targets:
       path: Sources/HeelerNotificationService/HeelerNotificationService.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.dev.bybee.heeler.shared
+          - $(HEELER_APP_GROUP)
     info:
       path: Sources/HeelerNotificationService/Info.plist
       properties:
@@ -203,12 +208,13 @@ targets:
         # App Store validation (code 90360) requires a display name on
         # every embedded appex; never user-visible for this extension.
         CFBundleDisplayName: Heeler Notification Service
+        HeelerAppGroup: $(HEELER_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.heeler.NotificationService
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEELER_BUNDLE_ID_PREFIX).heeler.NotificationService
         MARKETING_VERSION: "0.1.18"
         CURRENT_PROJECT_VERSION: "43"
         # Match the containing app's iPhone and iPad device family.
@@ -245,7 +251,7 @@ targets:
       path: Sources/HeelerWidgets/HeelerWidgets.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.dev.bybee.heeler.shared
+          - $(HEELER_APP_GROUP)
     info:
       path: Sources/HeelerWidgets/Info.plist
       properties:
@@ -258,11 +264,12 @@ targets:
         # App Store validation (code 90360) requires a display name on
         # every embedded appex. Also the counts-only lock-screen fallback.
         CFBundleDisplayName: Heeler
+        HeelerAppGroup: $(HEELER_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.heeler.Widgets
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEELER_BUNDLE_ID_PREFIX).heeler.Widgets
         MARKETING_VERSION: "0.1.18"
         CURRENT_PROJECT_VERSION: "43"
         # Match the containing app's iPhone and iPad device family.
@@ -329,7 +336,7 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.heeler.tests
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEELER_BUNDLE_ID_PREFIX).heeler.tests
     dependencies:
       - target: Heeler
       - package: HeelerSSH
@@ -347,7 +354,7 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.heeler.live-tests
+        PRODUCT_BUNDLE_IDENTIFIER: $(HEELER_BUNDLE_ID_PREFIX).heeler.live-tests
     dependencies:
       - target: Heeler
       - package: HeelerSSH

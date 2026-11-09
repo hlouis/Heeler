@@ -1444,6 +1444,7 @@
 		512561E4D83FFB6575A1A8A5 /* ConsoleHostStatusPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleHostStatusPresentationTests.swift; sourceTree = "<group>"; };
 		5128A4CB1086B4B250744B8B /* GrokDialogParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrokDialogParserTests.swift; sourceTree = "<group>"; };
 		51326DED49E0BABEFF681B04 /* DialogActionPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DialogActionPlanner.swift; sourceTree = "<group>"; };
+		515C93D32298E802221BF088 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		5162822D813D88BCFFE4D281 /* ClaudeTranscriptReducerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeTranscriptReducerTests.swift; sourceTree = "<group>"; };
 		518B30C9CD529B24F1787858 /* AgentUsageStyle+Report.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AgentUsageStyle+Report.swift"; sourceTree = "<group>"; };
 		519305F6554977DB6C5E93F2 /* AgentActivityContentStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentActivityContentStateTests.swift; sourceTree = "<group>"; };
@@ -3318,6 +3319,14 @@
 			path = Usage;
 			sourceTree = "<group>";
 		};
+		A6D077F3A07DF7FB56169ACE /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				515C93D32298E802221BF088 /* Base.xcconfig */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
 		ACBCD8A7C7BA02C7C313A5AA /* Transport */ = {
 			isa = PBXGroup;
 			children = (
@@ -3503,6 +3512,7 @@
 		CA64F2E56275EA06F4C854E0 = {
 			isa = PBXGroup;
 			children = (
+				A6D077F3A07DF7FB56169ACE /* Config */,
 				80BAAF0BFB8E96E9532F0F06 /* Packages */,
 				15E63192D8890DAC5DAF9873 /* plugin */,
 				7A08B9DEC86D2A9EA051704C /* Sources */,
@@ -3801,10 +3811,10 @@
 			projectRoot = "";
 			targets = (
 				081A3B29EFF2C7B2FCAA3248 /* Heeler */,
-				4E3ED42B1AF2AE6B521A235A /* HeelerLiveTests */,
 				DFFB82C74B73FA5CBCE6D5D2 /* HeelerNotificationService */,
-				9806EA6C63028F1217417282 /* HeelerTests */,
 				134E6CD1AC1396155DAB93E2 /* HeelerWidgets */,
+				9806EA6C63028F1217417282 /* HeelerTests */,
+				4E3ED42B1AF2AE6B521A235A /* HeelerLiveTests */,
 			);
 		};
 /* End PBXProject section */
@@ -4959,7 +4969,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.bybee.heeler.live-tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.live-tests";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Heeler.app/Heeler";
@@ -4968,6 +4978,7 @@
 		};
 		34586F556F6917B04E1E50C3 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 515C93D32298E802221BF088 /* Base.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -5002,7 +5013,6 @@
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 9VM4RM39R3;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -5038,7 +5048,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.Widgets;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.Widgets";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -5070,7 +5080,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -5088,7 +5098,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.Widgets;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.Widgets";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -5106,7 +5116,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.NotificationService;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.NotificationService";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -5114,6 +5124,7 @@
 		};
 		B6F12EBCC8FF4B5542EC7119 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 515C93D32298E802221BF088 /* Base.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -5148,7 +5159,6 @@
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 9VM4RM39R3;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -5189,7 +5199,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.tests";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Heeler.app/Heeler";
@@ -5206,7 +5216,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.tests";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Heeler.app/Heeler";
@@ -5223,7 +5233,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.bybee.heeler.live-tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.live-tests";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Heeler.app/Heeler";
@@ -5257,7 +5267,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -5275,7 +5285,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.18;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.bybee.heeler.NotificationService;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(HEELER_BUNDLE_ID_PREFIX).heeler.NotificationService";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

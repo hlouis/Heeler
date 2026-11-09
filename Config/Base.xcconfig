@@ -1,0 +1,13 @@
+// Signing identity of every target. These values are the published app's.
+// A fork that builds under its own Apple team overrides DEVELOPMENT_TEAM and
+// HEELER_BUNDLE_ID_PREFIX in Config/Local.xcconfig (gitignored); the bundle
+// IDs and the App Group follow the prefix.
+DEVELOPMENT_TEAM = 9VM4RM39R3
+HEELER_BUNDLE_ID_PREFIX = dev.bybee
+
+// Shared by the app and both extensions; doubles as the Keychain access group
+// holding the Notification Keys. Each bundle's Info.plist carries it as
+// HeelerAppGroup for NotificationKeyStore.sharedAccessGroup.
+HEELER_APP_GROUP = group.$(HEELER_BUNDLE_ID_PREFIX).heeler.shared
+
+#include? "Local.xcconfig"
