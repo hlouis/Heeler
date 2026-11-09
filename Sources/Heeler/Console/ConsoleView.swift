@@ -158,6 +158,7 @@ struct ConsoleView: View {
     @State private var splitVisibilities: [ConsoleTab: ConsoleSplitVisibilityState] = [:]
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.themeAppearance) private var themeAppearance
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.sceneWindow) private var sceneWindow
@@ -850,6 +851,10 @@ struct ConsoleView: View {
                     // detail one to bring the sidebar back. Removed here, it
                     // leaves the whole split view.
                     .toolbar(removing: usesSidebarNavigation ? .sidebarToggle : nil)
+                    // Beside a detail, both columns wear the terminal's theme
+                    // so they read as one window.
+                    .modifier(SplitColumnTheme(
+                        colors: presentation.usesRegularColumns ? themeColors : nil, fill: \.raised))
             } detail: {
                 // Every tab keeps its split view alive; only the selected one
                 // may mount the detail, or a terminal would attach twice.
@@ -888,6 +893,9 @@ struct ConsoleView: View {
                                     NavigationBarTopReader { detailBar = $0 }
                                 }
                             }
+                            .modifier(SplitColumnTheme(
+                                colors: presentation.usesRegularColumns ? themeColors : nil,
+                                fill: \.background))
                             .overlay(alignment: .top) {
                                 if horizontalSizeClass == .regular, !terminalOwnsTopEdge {
                                     Color(uiColor: .systemBackground)
@@ -1462,13 +1470,18 @@ struct ConsoleView: View {
         }
     }
 
+    /// The terminal theme of this appearance, for the surfaces it reaches.
+    private var themeColors: ThemeColors {
+        ThemeColors(themes: terminal.themes, appearance: themeAppearance)
+    }
+
     /// The chrome scheme of the terminal the detail shows, if any.
     private var stagedTerminalChromeScheme: ColorScheme? {
         // Hosts and Settings keep the selection but show no terminal.
         guard currentTab.isList else { return nil }
         if selectedTerminal != nil {
-            return terminal.themes.selection(for: colorScheme)
-                .chromeColorScheme(for: colorScheme)
+            return terminal.themes.selection(for: themeAppearance)
+                .chromeColorScheme(for: themeAppearance)
         }
         guard let id = notificationRouter.path.last, agentShowingChanges != id,
             agentShowingChat != id
@@ -1479,8 +1492,8 @@ struct ConsoleView: View {
             && MissingAgentPresentation(agentID: id, console: console, hosts: hosts)
                 .renderingMode == .progress
         guard showsTerminalSurface || showsTerminalSyncSurface else { return nil }
-        return terminal.themes.selection(for: colorScheme)
-            .chromeColorScheme(for: colorScheme)
+        return terminal.themes.selection(for: themeAppearance)
+            .chromeColorScheme(for: themeAppearance)
     }
 
     /// The detail column. Not keyed off the live Agent list alone: the
@@ -1628,15 +1641,15 @@ struct ConsoleView: View {
     @ViewBuilder
     private func missingAgentSurface(_ presentation: MissingAgentPresentation) -> some View {
         if presentation.renderingMode == .progress {
-            let theme = terminal.themes.selection(for: colorScheme)
+            let theme = terminal.themes.selection(for: themeAppearance)
             ZStack {
-                theme.surfaceBackground(for: colorScheme)
+                theme.surfaceBackground(for: themeAppearance)
                     .ignoresSafeArea(edges: detailSurfaceEdges(for: currentTab))
                 TerminalStatusDialog(
                     glyph: .progress,
                     title: presentation.title,
                     message: presentation.message,
-                    palette: theme.palette(for: colorScheme),
+                    palette: theme.palette(for: themeAppearance),
                     dimsBackground: false)
             }
         } else {
@@ -3197,6 +3210,24 @@ struct ConsoleHostStatusCountPills: View {
 
 /// The Agents list's style: plain rows, or for By Workspace an inset
 /// grouped list of cards on the other presentations' page.
+/// A split view column in the terminal theme's colours, filled with `fill`:
+/// the sidebar a step raised off the detail's background. Nil colours leave
+/// the system's.
+private struct SplitColumnTheme: ViewModifier {
+    let colors: ThemeColors?
+    let fill: KeyPath<ThemeColors, Color>
+
+    func body(content: Content) -> some View {
+        if let colors {
+            content
+                .wearsTheme(colors)
+                .containerBackground(colors[keyPath: fill], for: .navigation)
+        } else {
+            content
+        }
+    }
+}
+
 private struct ConsoleAgentListStyle: ViewModifier {
     let showsCards: Bool
     @Environment(\.isSidebarColumn) private var isSidebarColumn
