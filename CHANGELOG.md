@@ -9,6 +9,8 @@ Entries reference the pull request that made the change.
 
 ### Added
 
+- Open an image you sent to Claude Code or Codex by tapping its `[Image #N]` in your message, or with Preview Image in the message's menu, when it was pasted from a file, as Heeler's attached images are. (PR #674)
+- Read Heeler in Traditional Chinese (Taiwan). On a Traditional Chinese device, or with Traditional Chinese chosen as Heeler's language, everything Japanese and Simplified Chinese cover presents in Traditional Chinese, permission prompts included. (PR #668)
 - Read Heeler in Simplified Chinese. On a Simplified Chinese device, or with Simplified Chinese chosen as Heeler's language, everything Japanese covers presents in Chinese, permission prompts included. (PR #662)
 - Find Heeler's language in Settings > Language, which names the language Heeler shows and opens Heeler's page in iOS Settings, where iOS keeps each app's language. (PR #662)
 - Switch Claude Code's model and effort through Chat's title menu, under Model, with the current model on its second line beside a folder icon and the launch directory's last component. Permission mode stays beside the Composer. The native menu opens locally with fixed Opus, Sonnet, Haiku and Fable shortcuts, without probing the session or adding `/model` to the conversation merely by opening it. The title remains tappable while busy or switching; choices are enabled only while the Agent is Idle or Done and no send or switch is underway. Selecting sends `/model <alias>`; Claude Code resolves any user-configured third-party mapping and saves the selection as it normally does. Heeler does not configure mappings or verify provider availability. Permission modes cycle with Shift+Tab, bypass asks first, and effort uses `/effort`. The label changes only once the terminal confirms. (PR #647)
@@ -28,6 +30,9 @@ Entries reference the pull request that made the change.
 
 ### Fixed
 
+- Settle a Chat message whose attached image path stood on a line of its own. Claude Code records the image before the text, and Chat kept showing the message as sent but not yet in the conversation. (PR #674)
+- Find links on an Agent's terminal after a line with a character such as Claude Code's `❯` prompt. The link button stayed hidden for any link printed after it. (PR #672)
+- Center a checkout's icon on its title in the Agents list's By Workspace cards. A pinned Agent's card no longer lifts the icon above the title. (PR #669)
 - Show in the app's language the text that stayed in English under Japanese: each Host's line in Settings > Notifications, the Host Helper sheet's file counts, and a finished Grok Build subagent's tool calls, turns and duration. Short lists, such as a Host's Agent counts, join with the language's own separator, and a sentence closes with its own full stop. (PR #662)
 - Keep the sidebar hidden when Heeler returns from the background in portrait on an iPhone Duo's inner screen, an iPad, or another regular-width layout. It had slid back open on its own each time. (PR #663)
 - Keep Settings > Notifications steady while Hosts reconnect. A Host being read again keeps showing its last state, and one Host's connection retries no longer read every other Host again. (PR #661)
