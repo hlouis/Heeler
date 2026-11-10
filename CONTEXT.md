@@ -303,7 +303,8 @@ _Avoid_: favorite, star, bookmark
 **Composer**:
 The local input control below the Agent's live terminal: a native draft field
 that composes a message on device and delivers it in one piece. Only Voice
-Input sends anything elsewhere before delivery, and only a recording. Its
+Input with a speech service sends anything elsewhere before delivery, and only
+a recording. Its
 tools keyboard sends explicit keys, including characters on its Terminal page,
 directly to the Agent without editing the draft, while its Snippet and Skill
 tools insert into that draft. A draft insertion edits the draft and nothing
@@ -563,13 +564,16 @@ name the user gives it, shown above its text wherever Snippets are listed.
 _Avoid_: macro, template, shortcut, quick reply, tip
 
 **Voice Input**:
-The Composer's mic. A tap records, a second tap stops, and the recording goes
-to the speech service the user chose with their own API key: a built-in
-service or a Custom URL that speaks OpenAI's `audio/transcriptions` request.
-The text lands once, at the caret of the draft the recording started in, and
-nothing is sent. From the first tap until the text lands, a recording bar with
-Cancel, the microphone's level, and the time covers the controls before the
-mic, and Send or Stop hides, so a stray tap cannot send or interrupt the Agent.
+The Composer's mic. A tap records, a second tap stops. On Device (iOS 26 and
+later) turns speech into text on the phone and writes it at the caret of the
+draft the recording started in as it is heard, replacing its own earlier
+words, while the draft refuses typing and keeps its height. Otherwise the
+recording goes to the speech service the user chose with their own API key: a
+built-in service or a Custom URL that speaks OpenAI's `audio/transcriptions`
+request, and the text lands once at that caret. Nothing is sent to the Agent.
+From the first tap until the text settles, a recording bar with Cancel, the
+microphone's level, and the time covers the controls before the mic, and Send
+or Stop hides, so a stray tap cannot send or interrupt the Agent.
 It is not the system keyboard's dictation, which stays available in the
 standard keyboard, and its text is not a Transcript.
 _Avoid_: dictation, transcription (for the feature), speech mode

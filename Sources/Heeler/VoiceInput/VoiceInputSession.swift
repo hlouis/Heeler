@@ -36,6 +36,15 @@ struct VoiceInputFailure: Equatable, Sendable {
     }
 }
 
+/// Text for the draft from Voice Input. Text that is not final is what the
+/// device has heard so far, and the next update replaces it; final text
+/// ends the recording's place in the draft, and final empty text withdraws
+/// what the device wrote.
+struct VoiceDraftText: Equatable, Sendable {
+    let text: String
+    let isFinal: Bool
+}
+
 /// Voice Input in one Composer: the phase its controls show, and the
 /// recording kept for Retry. Its text goes into the draft of the Composer
 /// it started in, and nowhere else; the store does the insertion.
@@ -44,11 +53,11 @@ struct VoiceInputFailure: Equatable, Sendable {
 final class ComposerVoiceInput {
     enum Phase: Equatable {
         case idle
-        /// Asking for the microphone.
+        /// Asking for the microphone, or loading the device's model.
         case starting
         case recording(since: Date)
-        /// Uploading, or holding text until the input method's composition
-        /// ends.
+        /// Uploading, settling the device's last words, or holding text
+        /// until the input method's composition ends.
         case transcribing
         case failed(VoiceInputFailure)
     }
@@ -59,17 +68,24 @@ final class ComposerVoiceInput {
     /// the bar keeps showing what was heard, and clears when the next
     /// recording starts.
     fileprivate(set) var levels: [Double] = []
+    /// The device writes the recording into the draft as it is heard, and
+    /// the draft takes no other edits until the text settles (ADR 0043).
+    fileprivate(set) var writesLive = false
+    /// What the device has heard so far, for the folded Composer, whose
+    /// recording bar covers the draft.
+    fileprivate(set) var liveText = ""
     /// Send waits a moment after text lands: the text can turn Stop into
     /// Send under a finger that meant Stop.
     private(set) var isHoldingSend = false
-    /// The store's cue that `takeTranscript()` has text.
+    /// The store's cue that `takeDraftText()` has text.
     @ObservationIgnored var onTranscript: (@MainActor () -> Void)?
     @ObservationIgnored fileprivate weak var session: VoiceInputSession?
     @ObservationIgnored fileprivate var recording: VoiceRecording?
+    @ObservationIgnored fileprivate var transcriber: (any LiveVoiceTranscriber)?
     @ObservationIgnored fileprivate var task: Task<Void, Never>?
     @ObservationIgnored fileprivate var levelTask: Task<Void, Never>?
     @ObservationIgnored fileprivate var generation = 0
-    @ObservationIgnored private var transcript: String?
+    @ObservationIgnored private var pending: VoiceDraftText?
     @ObservationIgnored private var holdGeneration = 0
     @ObservationIgnored private let sendHold: Duration
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
@@ -92,6 +108,10 @@ final class ComposerVoiceInput {
 
     var blocksSend: Bool { isBusy || isHoldingSend }
 
+    /// The editor refuses typing while the device writes into the draft, so
+    /// the text it replaces stays where it was written.
+    var locksDraft: Bool { writesLive && isBusy }
+
     var isRecording: Bool {
         if case .recording = phase { true } else { false }
     }
@@ -106,13 +126,18 @@ final class ComposerVoiceInput {
         if case .failed(let failure) = phase { failure } else { nil }
     }
 
-    /// Hands over text waiting for the draft, ending this recording.
-    func takeTranscript() -> String? {
-        guard let transcript else { return nil }
-        self.transcript = nil
-        phase = .idle
-        holdSend()
-        return transcript
+    /// Hands over text waiting for the draft; final text ends this
+    /// recording.
+    func takeDraftText() -> VoiceDraftText? {
+        guard let pending else { return nil }
+        self.pending = nil
+        if pending.isFinal {
+            writesLive = false
+            liveText = ""
+            if isBusy { phase = .idle }
+            if !pending.text.isEmpty { holdSend() }
+        }
+        return pending
     }
 
     /// Drops the recording and any text still on its way: the recording
@@ -143,15 +168,23 @@ final class ComposerVoiceInput {
         task?.cancel()
         task = nil
         stopSamplingLevels()
-        transcript = nil
+        pending = nil
         self.phase = phase
         return generation
     }
 
     fileprivate func fail(_ failure: VoiceInputFailure) {
         task = nil
+        transcriber = nil
         stopSamplingLevels()
         phase = .failed(failure)
+        withdrawLiveText()
+    }
+
+    fileprivate func show(_ text: String) {
+        liveText = text
+        pending = VoiceDraftText(text: text, isFinal: false)
+        onTranscript?()
     }
 
     fileprivate func record(level: Double) {
@@ -169,7 +202,8 @@ final class ComposerVoiceInput {
     fileprivate func deliver(_ text: String) {
         task = nil
         recording = nil
-        transcript = text
+        transcriber = nil
+        pending = VoiceDraftText(text: text, isFinal: true)
         onTranscript?()
     }
 
@@ -177,10 +211,23 @@ final class ComposerVoiceInput {
         generation += 1
         task?.cancel()
         task = nil
+        transcriber?.cancel()
+        transcriber = nil
         stopSamplingLevels()
-        transcript = nil
         recording = nil
         phase = .idle
+        withdrawLiveText()
+    }
+
+    /// Takes back what the device wrote into the draft; with nothing
+    /// written, drops any text still waiting.
+    private func withdrawLiveText() {
+        guard writesLive else {
+            pending = nil
+            return
+        }
+        pending = VoiceDraftText(text: "", isFinal: true)
+        onTranscript?()
     }
 
     private func holdSend() {
@@ -213,6 +260,8 @@ final class VoiceInputSession {
     let settings: VoiceInputSettings
     @ObservationIgnored private let recorder: any VoiceRecorder
     @ObservationIgnored private let transcribe: @Sendable (VoiceTranscriptionRequest) async throws -> String
+    /// The device's own recognition, nil where the system has none.
+    @ObservationIgnored private let makeLiveTranscriber: @MainActor () -> (any LiveVoiceTranscriber)?
     @ObservationIgnored private let now: @MainActor () -> Date
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     /// The input whose recording holds the microphone.
@@ -228,19 +277,24 @@ final class VoiceInputSession {
         let client = VoiceTranscriptionClient()
         self.init(
             settings: settings, recorder: SystemVoiceRecorder(),
-            transcribe: { try await client.transcribe($0) })
+            transcribe: { try await client.transcribe($0) },
+            makeLiveTranscriber: {
+                if #available(iOS 26.0, *) { DeviceVoiceTranscriber() } else { nil }
+            })
     }
 
     init(
         settings: VoiceInputSettings,
         recorder: any VoiceRecorder,
         transcribe: @escaping @Sendable (VoiceTranscriptionRequest) async throws -> String,
+        makeLiveTranscriber: @escaping @MainActor () -> (any LiveVoiceTranscriber)? = { nil },
         now: @escaping @MainActor () -> Date = { Date() },
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.settings = settings
         self.recorder = recorder
         self.transcribe = transcribe
+        self.makeLiveTranscriber = makeLiveTranscriber
         self.now = now
         self.sleep = sleep
         recorder.onEnded = { [weak self] in self?.stopRecording() }
@@ -271,11 +325,21 @@ final class VoiceInputSession {
         input.recording = nil
         input.levels = []
         let generation = input.begin(.starting)
+        let onDevice = settings.service == .onDevice
         input.task = Task { [weak self, weak input] in
             guard let self else { return }
             let granted = await recorder.requestPermission()
             guard let input, input.generation == generation else { return }
-            beginRecording(input, granted: granted)
+            guard granted else {
+                input.fail(.microphoneDenied)
+                return
+            }
+            var onAudio: VoiceAudioSink?
+            if onDevice {
+                guard let sink = await startTranscriber(for: input, generation: generation) else { return }
+                onAudio = sink
+            }
+            beginRecording(input, onAudio: onAudio)
         }
         return .handled
     }
@@ -288,9 +352,14 @@ final class VoiceInputSession {
         do {
             recording = try recorder.stop()
         } catch {
+            input.transcriber?.cancel()
             input.fail(
                 VoiceInputFailure(
                     message: (error as? VoiceRecorderError ?? .recordingFailed).message))
+            return
+        }
+        if let transcriber = input.transcriber {
+            settle(transcriber, recording: recording, for: input)
             return
         }
         guard recording.duration >= Self.minimumDuration else {
@@ -330,27 +399,77 @@ final class VoiceInputSession {
         }
     }
 
-    private func beginRecording(_ input: ComposerVoiceInput, granted: Bool) {
-        input.task = nil
-        guard granted else {
-            input.fail(.microphoneDenied)
-            return
+    /// Loads the device's model; nil when the recording failed or was
+    /// dropped meanwhile.
+    private func startTranscriber(
+        for input: ComposerVoiceInput, generation: Int
+    ) async -> VoiceAudioSink? {
+        guard let transcriber = makeLiveTranscriber() else {
+            input.fail(LiveVoiceTranscriberError.unavailable.failure)
+            return nil
         }
+        input.transcriber = transcriber
+        let sink: VoiceAudioSink
+        do {
+            sink = try await transcriber.start(
+                locale: settings.onDeviceLanguage, keywords: settings.keywords
+            ) { [weak input, weak transcriber] text in
+                guard let input, let transcriber, input.transcriber === transcriber else { return }
+                input.show(text)
+            }
+        } catch {
+            transcriber.cancel()
+            guard input.generation == generation else { return nil }
+            input.fail((error as? LiveVoiceTranscriberError ?? .failed).failure)
+            return nil
+        }
+        guard input.generation == generation else {
+            transcriber.cancel()
+            return nil
+        }
+        return sink
+    }
+
+    private func beginRecording(_ input: ComposerVoiceInput, onAudio: VoiceAudioSink?) {
+        input.task = nil
         // Another Composer may have taken the microphone during the request.
         if let other = recordingInput, other !== input { stop(other) }
         do {
             try recorder.start(
                 maxDuration: Self.maximumDuration,
-                builtInMicrophone: settings.alwaysUsesBuiltInMicrophone)
+                builtInMicrophone: settings.alwaysUsesBuiltInMicrophone,
+                onAudio: onAudio)
         } catch {
+            input.transcriber?.cancel()
             input.fail(
                 VoiceInputFailure(
                     message: (error as? VoiceRecorderError ?? .microphoneUnavailable).message))
             return
         }
         recordingInput = input
+        input.writesLive = input.transcriber != nil
         input.phase = .recording(since: now())
         sampleLevels(of: input)
+    }
+
+    /// The device settles its last words. Text already written stays if
+    /// settling fails.
+    private func settle(
+        _ transcriber: any LiveVoiceTranscriber, recording: VoiceRecording,
+        for input: ComposerVoiceInput
+    ) {
+        input.recording = recording
+        let generation = input.begin(.transcribing)
+        input.task = Task { [weak input] in
+            let text = try? await transcriber.finish()
+            guard let input, input.generation == generation else { return }
+            let heard = text.flatMap { $0.isEmpty ? nil : $0 } ?? input.liveText
+            if heard.isEmpty {
+                input.fail(VoiceInputFailure(.emptyTranscript))
+            } else {
+                input.deliver(heard)
+            }
+        }
     }
 
     private func sampleLevels(of input: ComposerVoiceInput) {

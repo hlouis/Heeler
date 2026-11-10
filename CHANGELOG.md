@@ -9,6 +9,7 @@ Entries reference the pull request that made the change.
 
 ### Added
 
+- Turn speech into text on the device with Voice Input's On Device service, from iOS 26. Text appears in the draft as you speak and settles when you stop; Cancel takes it back. It needs no API key, listens for one chosen language with English words inside it, and uses your Keywords as hints. Its speech model downloads from Settings › Voice Input.
 - Open an image you sent to Claude Code or Codex by tapping its `[Image #N]` in your message, or with Preview Image in the message's menu, when it was pasted from a file, as Heeler's attached images are. (PR #674)
 - Read Heeler in Traditional Chinese (Taiwan). On a Traditional Chinese device, or with Traditional Chinese chosen as Heeler's language, everything Japanese and Simplified Chinese cover presents in Traditional Chinese, permission prompts included. (PR #668)
 - Read Heeler in Simplified Chinese. On a Simplified Chinese device, or with Simplified Chinese chosen as Heeler's language, everything Japanese covers presents in Chinese, permission prompts included. (PR #662)
@@ -22,6 +23,7 @@ Entries reference the pull request that made the change.
 
 ### Changed
 
+- Keep music and other audio playing where it plays while Voice Input records, including on a Bluetooth speaker or headphones, instead of stopping it. Recordings are kept in memory only, never in a temporary file.
 - Lead the Host Helper sheet with its status and a prominent Install, and list what it writes as Helper, LaunchAgent or systemd Unit, and Pi & Oh My Pi with file counts. Each opens one folder at a time, subfolders first, with the folder's path below, instead of every absolute path in one list. (PR #661)
 - Show each Host in Settings > Notifications as one row with its switch and a line saying what is on or what it needs. Done Notifications, Live Activity and their notes move to the Host's own page, which on a herdr-core Host also shows the Host Helper's status and opens its sheet on the Host's page in Hosts. (PR #661)
 - Select terminal text inline with handles and the system edit menu, using libghostty-spm 2.2.2026103001. Chat's Select Text sheet is unchanged. (PR #650)

@@ -73,6 +73,9 @@ struct ComposerVoiceButton: View {
 /// VoiceOver.
 struct ComposerVoiceBar: View {
     let voice: ComposerVoiceInput
+    /// The bar covers the folded draft, so the end of what the device has
+    /// heard shows in the waveform's place.
+    var showsLiveText = false
     let cancel: () -> Void
 
     var body: some View {
@@ -89,10 +92,18 @@ struct ComposerVoiceBar: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Cancel Voice Input")
             .accessibilityIdentifier("composer.voice-cancel")
-            ComposerVoiceWaveform(levels: voice.levels, isLive: voice.isRecording)
-                .frame(maxWidth: .infinity)
-                .frame(height: 22)
-                .accessibilityHidden(true)
+            if showsLiveText, !voice.liveText.isEmpty {
+                Text(voice.liveText)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                ComposerVoiceWaveform(levels: voice.levels, isLive: voice.isRecording)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 22)
+                    .accessibilityHidden(true)
+            }
             elapsed
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
