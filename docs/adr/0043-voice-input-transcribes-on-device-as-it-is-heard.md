@@ -30,7 +30,7 @@ The rest of ADR 0036 stands.
   input area gives way to a recorder, outlined in red, with the keyboard put
   away; the status line and Agent switcher stay. It shows the text as it is
   heard, settled words in full and words still being revised underlined,
-  after the whole draft in a fainter color, with a caret at the end; a
+  after the whole draft, with a caret at the end; a
   prompt appears only in an empty draft, so it never covers the user's text. Its text box grows a line
   at a time up to three and never shrinks while recording, so the terminal
   above resizes at most twice; longer text scrolls. Below it are the level

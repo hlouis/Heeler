@@ -8,7 +8,7 @@ import UIKit
 /// until it is dismissed.
 struct ComposerLiveVoiceRecorder: View {
     let voice: ComposerVoiceInput
-    /// The draft, shown faintly ahead of what is heard, which joins its end.
+    /// The draft, shown ahead of what is heard, which joins its end.
     let draft: String
     let stop: () -> Void
     let send: () -> Void
@@ -144,8 +144,8 @@ struct ComposerLiveVoiceRecorder: View {
 }
 
 /// The draft, then what the device has heard joined to its end, as the draft
-/// will read: settled words in full, words it may still revise underlined,
-/// and the caret after them. The box grows a line at a time up to three and
+/// will read: the draft and settled words in full, words it may still revise
+/// faint and underlined, and the caret after them. The box grows a line at a time up to three and
 /// never shrinks while recording, so the terminal above resizes at most
 /// twice; longer text keeps its newest lines and fades out at the top.
 private struct ComposerLiveVoiceText: View {
@@ -200,8 +200,7 @@ private struct ComposerLiveVoiceText: View {
         let joined = heard.text.isEmpty
             ? "" : VoiceInputSpacing.fitted(heard.text, after: draft.last, before: nil)
         let space = joined.hasPrefix(" ") ? " " : ""
-        var draft = AttributedString(draft + space)
-        draft.foregroundColor = .secondary
+        let draft = AttributedString(draft + space)
         let settled = AttributedString(heard.settled)
         var revising = AttributedString(heard.revising)
         revising.foregroundColor = .secondary
