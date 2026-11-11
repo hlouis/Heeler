@@ -7,26 +7,35 @@ enum LiveVoiceTranscriberError: Error, Equatable, Sendable {
     /// Before iOS 26, or no dictation model for this device.
     case unavailable
     case languageUnsupported
-    /// The language's model is not on the device yet; Settings downloads it.
+    /// The language's model is not on the device yet.
     case modelNotInstalled
+    case downloadFailed
     case failed
 
     var failure: VoiceInputFailure {
         switch self {
         case .unavailable:
             VoiceInputFailure(
-                message: String(localized: "This device can't transcribe speech on its own. Choose a speech service."),
-                opensVoiceInputSettings: true)
+                message: String(localized: "This device can't transcribe speech on its own."),
+                detail: String(localized: "Choose a speech service in Voice Input settings."),
+                symbol: "iphone.slash", opensVoiceInputSettings: true)
         case .languageUnsupported:
             VoiceInputFailure(
                 message: String(localized: "This device can't transcribe the chosen language."),
-                opensVoiceInputSettings: true)
+                detail: String(localized: "Choose another language or a speech service in Voice Input settings."),
+                symbol: "globe", opensVoiceInputSettings: true)
         case .modelNotInstalled:
             VoiceInputFailure(
-                message: String(localized: "Download the speech model for this language in Voice Input settings."),
-                opensVoiceInputSettings: true)
+                message: String(localized: "This language's speech model is needed."),
+                detail: String(localized: "Download it once to transcribe on this device, without a network."),
+                symbol: "arrow.down.circle", downloadsModel: true)
+        case .downloadFailed:
+            VoiceInputFailure(
+                message: String(localized: "The speech model could not be downloaded."),
+                detail: String(localized: "Check the network and try again."),
+                symbol: "arrow.down.circle", downloadsModel: true)
         case .failed:
-            VoiceInputFailure(message: String(localized: "Speech recognition stopped unexpectedly."))
+            VoiceInputFailure(message: String(localized: "Speech recognition could not start."))
         }
     }
 }
@@ -35,15 +44,17 @@ enum LiveVoiceTranscriberError: Error, Equatable, Sendable {
 @MainActor
 protocol LiveVoiceTranscriber: AnyObject {
     /// Loads `locale`'s model, biased toward `keywords`, and returns where
-    /// the recorder sends audio. `onText` gets the whole text so far each
-    /// time it changes: settled words, then those still being revised.
+    /// the recorder sends audio. `onText` gets everything heard so far each
+    /// time it changes.
     func start(
-        locale: String, keywords: [String], onText: @escaping @MainActor (String) -> Void
+        locale: String, keywords: [String], onText: @escaping @MainActor (VoiceHeard) -> Void
     ) async throws -> VoiceAudioSink
     /// Settles the rest of what was heard and returns the whole text.
     func finish() async throws -> String
     /// Stops at once and drops what was not settled.
     func cancel()
+    /// Downloads `locale`'s model, reporting progress from 0 to 1.
+    func downloadModel(locale: String, progress: @escaping @MainActor (Double) -> Void) async throws
 }
 
 /// Whether a language's on-device model is ready.
@@ -67,7 +78,7 @@ final class DeviceVoiceTranscriber: LiveVoiceTranscriber {
     init() {}
 
     func start(
-        locale identifier: String, keywords: [String], onText: @escaping @MainActor (String) -> Void
+        locale identifier: String, keywords: [String], onText: @escaping @MainActor (VoiceHeard) -> Void
     ) async throws -> VoiceAudioSink {
         let module = try await Self.module(for: identifier)
         guard await AssetInventory.status(forModules: [module]) == .installed else {
@@ -88,19 +99,18 @@ final class DeviceVoiceTranscriber: LiveVoiceTranscriber {
         self.analyzer = analyzer
         self.input = input
         results = Task { @MainActor in
-            var settled = ""
-            var revising = ""
+            var heard = VoiceHeard()
             for try await result in module.results {
                 let text = String(result.text.characters)
                 if result.isFinal {
-                    settled += text
-                    revising = ""
+                    heard.settled += text
+                    heard.revising = ""
                 } else {
-                    revising = text
+                    heard.revising = text
                 }
-                onText(settled + revising)
+                onText(heard)
             }
-            return settled + revising
+            return heard.text
         }
         let converter = VoicePCMConverter(to: format)
         return { buffer in
@@ -128,6 +138,10 @@ final class DeviceVoiceTranscriber: LiveVoiceTranscriber {
             Task { await analyzer.cancelAndFinishNow() }
         }
         analyzer = nil
+    }
+
+    func downloadModel(locale: String, progress: @escaping @MainActor (Double) -> Void) async throws {
+        try await Self.downloadModel(for: locale, progress: progress)
     }
 
     /// The languages this device can transcribe, as BCP 47 identifiers.

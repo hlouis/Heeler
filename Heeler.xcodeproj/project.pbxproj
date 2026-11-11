@@ -820,6 +820,7 @@
 		C56F5A20CB02597213EE1210 /* AgentUsagePresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E6F1DD7869853EF91C15A0 /* AgentUsagePresentationTests.swift */; };
 		C577E6F7D424D0B645504650 /* ConsolePaneRowBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2787D9F2267D26DD4012008E /* ConsolePaneRowBuilder.swift */; };
 		C57F86EB262BAC6ABE017179 /* CodexJSONPrefix.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BC98C804D7AC9D39D249B99 /* CodexJSONPrefix.swift */; };
+		C6091E60672FFF85AB99EEDE /* ComposerLiveVoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = D842B59171066E39D6832108 /* ComposerLiveVoiceRecorder.swift */; };
 		C626797B247A8ED6513D2EBB /* HeelerSSHSessionE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1AEA55D1F06B12005DEEE5F /* HeelerSSHSessionE2ETests.swift */; };
 		C6E6E92365F39EDDD50CDE49 /* WeakNetworkE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AB8C5EA497D1094E86F69C4 /* WeakNetworkE2ETests.swift */; };
 		C704DD32F915E3C827356276 /* ReadableColumn.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA34B35B5CAE41E2AAC2DF75 /* ReadableColumn.swift */; };
@@ -2004,6 +2005,7 @@
 		D75D42118459DEA416288A33 /* ChatSendRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatSendRulesTests.swift; sourceTree = "<group>"; };
 		D7986AEFB2416F8754FE42B3 /* herdr-core-frames-windows-v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "herdr-core-frames-windows-v1.json"; sourceTree = "<group>"; };
 		D79A0CCBD828E937D32FACCE /* HerdrCorePiChatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerdrCorePiChatTests.swift; sourceTree = "<group>"; };
+		D842B59171066E39D6832108 /* ComposerLiveVoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerLiveVoiceRecorder.swift; sourceTree = "<group>"; };
 		D8662F9C006A78F4020F3ADF /* ChatBackgroundWorkPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatBackgroundWorkPresentation.swift; sourceTree = "<group>"; };
 		D8B3366BC1B0D37A0C4EE525 /* EdgeDockSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeDockSettingsTests.swift; sourceTree = "<group>"; };
 		D90FC76C9682026600DC1AC5 /* CodexIncrementalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexIncrementalTests.swift; sourceTree = "<group>"; };
@@ -3002,6 +3004,7 @@
 				1D46328CE795C513FE11AD04 /* ClosePaneStore.swift */,
 				24572762858C00624BE837E8 /* ComposerDeliveryPolicy.swift */,
 				D663C74D9F4453BB34CA7A36 /* ComposerDrop.swift */,
+				D842B59171066E39D6832108 /* ComposerLiveVoiceRecorder.swift */,
 				974D58E1400071FFEC11333C /* ComposerVoiceControls.swift */,
 				6D83F0739372AE699009E238 /* ConsoleAgent.swift */,
 				0CD8A096E577BF34431CFF3D /* ConsoleCommandAvailability.swift */,
@@ -4136,6 +4139,7 @@
 				A25D752D1FF77B0A6F4DAA15 /* CommandBlock.swift in Sources */,
 				DB2D4ECC14CBA551236420C2 /* ComposerDeliveryPolicy.swift in Sources */,
 				49924070055C376D1C0E2A8E /* ComposerDrop.swift in Sources */,
+				C6091E60672FFF85AB99EEDE /* ComposerLiveVoiceRecorder.swift in Sources */,
 				DAC71CBDA8D8B092ED157288 /* ComposerStagingStatusBar.swift in Sources */,
 				247E069905D31490FEF889CE /* ComposerStagingStore.swift in Sources */,
 				82D2E1E1417F79DDFD5A3BFF /* ComposerVoiceControls.swift in Sources */,

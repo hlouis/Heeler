@@ -90,6 +90,9 @@ final class AgentComposerStore: ComposerDraftOperations {
     /// Voice Input for this draft (ADR 0036). Send waits while it records
     /// or transcribes, so the text always has a draft to land in.
     let voice: ComposerVoiceInput
+    /// Bumped when a recording stopped with Send has landed its text; the
+    /// view then sends the draft through its own Send.
+    private(set) var voiceSendRequests = 0
 
     private let target: String
     private var agentStatus: AgentStatus
@@ -122,8 +125,6 @@ final class AgentComposerStore: ComposerDraftOperations {
     /// The editor holds marked text. Writing the draft then would destroy
     /// it, so Voice Input's text waits until the composition ends.
     @ObservationIgnored private var isEditorComposing = false
-    /// Where the text the device is still hearing sits in the draft.
-    @ObservationIgnored private var voiceSpan: NSRange?
 
     private struct PendingDroppedImage {
         enum Status: Equatable {
@@ -256,20 +257,18 @@ final class AgentComposerStore: ComposerDraftOperations {
         if !composing { insertVoiceTextIfReady() }
     }
 
-    /// Voice Input's text, at the caret like a Snippet. Send waited all
-    /// along, so the draft it lands in is the one the user is editing. Text
-    /// the device is still hearing replaces its own earlier text in place,
-    /// while the editor refuses typing (ADR 0043).
+    /// Voice Input's one insertion, at the caret like a Snippet. Send waited
+    /// all along, so the draft it lands in is the one the user is editing.
+    /// A recording stopped with Send asks the view to send the draft as its
+    /// Send does (ADR 0043).
     private func insertVoiceTextIfReady() {
-        guard !isEditorComposing, let update = voice.takeDraftText() else { return }
-        let range: NSRange
-        if let voiceSpan {
-            range = Self.clamped(voiceSpan, to: draft)
-        } else if update.text.isEmpty {
-            return
-        } else {
-            range = Self.clamped(draftSelection, to: draft)
-        }
+        guard !isEditorComposing, let landed = voice.takeDraftText() else { return }
+        if !landed.text.isEmpty { insertVoiceText(landed.text) }
+        if landed.sends { voiceSendRequests += 1 }
+    }
+
+    private func insertVoiceText(_ text: String) {
+        let range = Self.clamped(draftSelection, to: draft)
         let characters = draft as NSString
         let before = range.location > 0
             ? characters.substring(
@@ -279,12 +278,7 @@ final class AgentComposerStore: ComposerDraftOperations {
         let after = end < characters.length
             ? characters.substring(with: characters.rangeOfComposedCharacterSequence(at: end)).first
             : nil
-        let text = update.text.isEmpty
-            ? "" : VoiceInputSpacing.fitted(update.text, after: before, before: after)
-        let length = (text as NSString).length
-        draft = characters.replacingCharacters(in: range, with: text)
-        draftSelection = NSRange(location: range.location + length, length: 0)
-        voiceSpan = update.isFinal ? nil : NSRange(location: range.location, length: length)
+        insertIntoDraft(VoiceInputSpacing.fitted(text, after: before, before: after))
     }
 
     /// Forwards dropped images onto ``ComposerStagingStore.begin(_:)``, the

@@ -566,16 +566,17 @@ name the user gives it, shown above its text wherever Snippets are listed.
 _Avoid_: macro, template, shortcut, quick reply, tip
 
 **Voice Input**:
-The Composer's mic. A tap records, a second tap stops. On Device (iOS 26 and
-later) turns speech into text on the phone and writes it at the caret of the
-draft the recording started in as it is heard, replacing its own earlier
-words, while the draft refuses typing and keeps its height. Otherwise the
-recording goes to the speech service the user chose with their own API key: a
-built-in service or a Custom URL that speaks OpenAI's `audio/transcriptions`
-request, and the text lands once at that caret. Nothing is sent to the Agent.
-From the first tap until the text settles, a recording bar with Cancel, the
-microphone's level, and the time covers the controls before the mic, and Send
-or Stop hides, so a stray tap cannot send or interrupt the Agent.
+The Composer's mic. With On Device (iOS 26 and later) the phone turns speech
+into text: a recorder outlined in red takes the input's place and shows the
+text as it is heard, and its Stop puts the text at the caret of the draft the
+recording started in, while its Send does that and sends the draft. Otherwise
+a tap records and a second tap stops; the recording goes to the speech service
+the user chose with their own API key, a built-in service or a Custom URL that
+speaks OpenAI's `audio/transcriptions` request, and the text lands once at
+that caret, with nothing sent. From the first tap until that text lands, a
+recording bar with Cancel, the microphone's level, and the time covers the
+controls before the mic, and Send or Stop hides, so a stray tap cannot send or
+interrupt the Agent.
 It is not the system keyboard's dictation, which stays available in the
 standard keyboard, and its text is not a Transcript.
 _Avoid_: dictation, transcription (for the feature), speech mode
