@@ -839,12 +839,10 @@ struct AgentComposerView: View {
     /// its text lands in the draft (ADR 0043).
     private var liveVoiceRecorder: AnyView? {
         guard let voiceInput, inputMode == .composer, store.voice.showsRecorder else { return nil }
-        let caret = min(store.draftSelection.location, (store.draft as NSString).length)
         return AnyView(
             ComposerLiveVoiceRecorder(
                 voice: store.voice,
-                draftBeforeCaret: (store.draft as NSString).substring(to: caret),
-                draftHasText: store.draft.contains(where: { !$0.isWhitespace }),
+                draft: store.draft,
                 stop: { voiceInput.stop(store.voice) },
                 send: { voiceInput.stop(store.voice, sending: true) },
                 downloadModel: { voiceInput.downloadModel(store.voice) },

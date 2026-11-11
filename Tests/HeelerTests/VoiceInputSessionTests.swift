@@ -87,7 +87,7 @@ struct VoiceInputSessionTests {
         fixture.live.finalText = "Look at the useEffect hook."
         fixture.session.stop(store.voice)
         try await waitUntil("settled") { store.voice.phase == .idle }
-        #expect(store.draft == "fix. Look at the useEffect hook. Then commit", "the text lands at the caret")
+        #expect(store.draft == "fix. Then commit Look at the useEffect hook.", "the text joins the draft's end, as the recorder showed")
         #expect(
             store.draftSelection == NSRange(location: (store.draft as NSString).length, length: 0),
             "the caret goes after all the text")

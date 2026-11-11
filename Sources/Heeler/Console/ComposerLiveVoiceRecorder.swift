@@ -8,10 +8,8 @@ import UIKit
 /// until it is dismissed.
 struct ComposerLiveVoiceRecorder: View {
     let voice: ComposerVoiceInput
-    /// The draft before the caret, shown faintly ahead of what is heard.
-    let draftBeforeCaret: String
-    /// The draft already holds something to send.
-    let draftHasText: Bool
+    /// The draft, shown faintly ahead of what is heard, which joins its end.
+    let draft: String
     let stop: () -> Void
     let send: () -> Void
     let downloadModel: () -> Void
@@ -29,8 +27,8 @@ struct ComposerLiveVoiceRecorder: View {
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 ComposerLiveVoiceText(
-                    context: Self.context(draftBeforeCaret), heard: voice.heard,
-                    placeholder: placeholder, isPreparing: voice.phase == .starting)
+                    draft: draft, heard: voice.heard, placeholder: placeholder,
+                    showsCaret: voice.phase != .transcribing)
                 controls
             }
         }
@@ -122,43 +120,40 @@ struct ComposerLiveVoiceRecorder: View {
     }
 
     private var canSend: Bool {
-        voice.isRecording && (!voice.heard.text.isEmpty || draftHasText)
+        voice.isRecording
+            && (!voice.heard.text.isEmpty || draft.contains(where: { !$0.isWhitespace }))
     }
 
+    /// Shown only in an empty draft, so it never covers the user's text.
     private var placeholder: String? {
-        switch voice.phase {
-        case .starting: String(localized: "Getting the microphone ready…")
-        case .recording: String(localized: "Start speaking")
-        case .idle, .transcribing, .downloadingModel, .failed: nil
-        }
+        voice.isRecording ? String(localized: "Start speaking") : nil
     }
 
     private var hint: String? {
-        guard isSettling else { return nil }
-        return voice.sendsWhenSettled
-            ? String(localized: "Sending once the last words settle")
-            : String(localized: "Settling the last words…")
-    }
-
-    /// The end of the draft before the caret, enough to show where the
-    /// text goes.
-    static func context(_ before: String) -> String {
-        let trimmed = before.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        let tail = trimmed.count > 40 ? "…" + trimmed.suffix(40) : trimmed
-        return tail + " "
+        switch voice.phase {
+        case .starting:
+            String(localized: "Getting the microphone ready…")
+        case .transcribing:
+            voice.sendsWhenSettled
+                ? String(localized: "Sending once the last words settle")
+                : String(localized: "Settling the last words…")
+        case .idle, .recording, .downloadingModel, .failed:
+            nil
+        }
     }
 }
 
-/// What the device has heard, settled words in full and words it may still
-/// revise underlined. The box grows a line at a time up to three and never
-/// shrinks while recording, so the terminal above resizes at most twice;
-/// longer text keeps its newest lines and fades out at the top.
+/// The draft, then what the device has heard joined to its end, as the draft
+/// will read: settled words in full, words it may still revise underlined,
+/// and the caret after them. The box grows a line at a time up to three and
+/// never shrinks while recording, so the terminal above resizes at most
+/// twice; longer text keeps its newest lines and fades out at the top.
 private struct ComposerLiveVoiceText: View {
-    let context: String
+    let draft: String
     let heard: VoiceHeard
+    /// Shown only when there is neither draft nor heard text.
     let placeholder: String?
-    let isPreparing: Bool
+    let showsCaret: Bool
     @State private var peakHeight: CGFloat = 0
     @State private var contentHeight: CGFloat = 0
 
@@ -188,30 +183,38 @@ private struct ComposerLiveVoiceText: View {
             .accessibilityElement(children: .combine)
     }
 
-    @ViewBuilder
     private var content: some View {
-        if heard.text.isEmpty, let placeholder {
-            HStack(spacing: 8) {
-                if isPreparing {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Text(placeholder)
-                    .foregroundStyle(.secondary)
+        // Blinks the caret by redrawing the text twice a second.
+        TimelineView(.periodic(from: .now, by: 0.5)) { timeline in
+            let caretShows = showsCaret
+                && Int(timeline.date.timeIntervalSinceReferenceDate * 2) % 2 == 0
+            if draft.isEmpty, heard.text.isEmpty, let placeholder {
+                Text(caret(shows: caretShows)) + Text(placeholder).foregroundStyle(.secondary)
+            } else {
+                Text(attributed + caret(shows: caretShows))
             }
-        } else {
-            Text(attributed)
         }
     }
 
     private var attributed: AttributedString {
-        var context = AttributedString(context)
-        context.foregroundColor = .secondary
+        let joined = heard.text.isEmpty
+            ? "" : VoiceInputSpacing.fitted(heard.text, after: draft.last, before: nil)
+        let space = joined.hasPrefix(" ") ? " " : ""
+        var draft = AttributedString(draft + space)
+        draft.foregroundColor = .secondary
         let settled = AttributedString(heard.settled)
         var revising = AttributedString(heard.revising)
         revising.foregroundColor = .secondary
         revising.underlineStyle = Text.LineStyle(pattern: .dot)
-        return context + settled + revising
+        return draft + settled + revising
+    }
+
+    /// A thin bar in the tint, like the input's caret; clear while it blinks
+    /// off, so the text never shifts.
+    private func caret(shows: Bool) -> AttributedString {
+        var caret = AttributedString("\u{258F}")
+        caret.foregroundColor = shows ? Color.accentColor : .clear
+        return caret
     }
 }
 

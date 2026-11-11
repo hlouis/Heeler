@@ -30,13 +30,15 @@ The rest of ADR 0036 stands.
   input area gives way to a recorder, outlined in red, with the keyboard put
   away; the status line and Agent switcher stay. It shows the text as it is
   heard, settled words in full and words still being revised underlined,
-  after a faint tail of the draft before the caret. Its text box grows a line
+  after the whole draft in a fainter color, with a caret at the end; a
+  prompt appears only in an empty draft, so it never covers the user's text. Its text box grows a line
   at a time up to three and never shrinks while recording, so the terminal
   above resizes at most twice; longer text scrolls. Below it are the level
   and time, Stop, and Send.
 - **The draft still takes the text once.** Stop settles the last words and
-  inserts the text at the caret, as ADR 0036 does for an upload. Send does
-  the same, then sends the draft through the Composer's own Send, so its
+  appends the text to the draft, where the recorder showed it, then focuses
+  the input with the caret after all the text. Send does the same without
+  the focus, then sends the draft through the Composer's own Send, so its
   refusals stay where they are. There is no Cancel: unwanted words are
   deleted from the draft like typed ones. Every other ending — the time
   limit, a call, an engine error, leaving the screen — lands what was heard
