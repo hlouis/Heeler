@@ -8,8 +8,9 @@ status: accepted
 sends a finished recording to the user's speech service and lets the draft
 take the text once. Voice Input now also offers On Device, Apple's dictation
 model from iOS 26, whose text arrives while the user speaks. This amends
-ADR 0036's "Upload, not streaming", "The draft takes the text once" and its
-rejection of live partials; the rest of ADR 0036 stands.
+ADR 0036's "Upload, not streaming" and its rejection of live partials: the
+partials show in a recorder, not the draft, which still takes the text once.
+The rest of ADR 0036 stands.
 
 ## Decision
 
@@ -17,24 +18,31 @@ rejection of live partials; the rest of ADR 0036 stands.
   or agreement, since nothing leaves the device. It uses
   `DictationTranscriber` with `progressiveShortDictation`, the keyboard
   dictation model, and passes Keywords as `contextualStrings`. The model is
-  downloaded from Settings; a recording that finds it missing fails with a
-  pointer there instead of waiting on a download.
+  downloaded from Settings or from the recorder when a recording finds it
+  missing; recording never waits on a download it did not ask for.
 - **One language per recording.** Every Speech transcriber takes one
   `Locale` (unchanged through the iOS 27.2 SDK). A Chinese locale keeps
   English words spoken inside Chinese; an English locale garbles Chinese, so
   the language is the one the user mostly speaks. On a Mac probe with
   synthetic zh + en speech, Keywords turned most misheard identifiers into
   exact ones.
-- **Text is written into the draft as it is heard.** The recording's text
-  holds one range of the draft, starting at the caret; each update replaces
-  that range, and the final text ends it. ADR 0036's objections are met
-  rather than avoided: Send and Stop already hide while recording; the editor
-  keeps the keyboard but refuses typing, so the range stays where it was
-  written and no store write lands on marked text; and the editor keeps the
-  height it had when writing began, scrolling inside it, so the terminal
-  above and its PTY keep their size until the text settles. Cancel withdraws
-  the text. While the Composer is folded, the recording bar covers the draft
-  and shows the end of the text in the waveform's place.
+- **A recorder takes the input's place.** From the first tap the Composer's
+  input area gives way to a recorder, outlined in red, with the keyboard put
+  away; the status line and Agent switcher stay. It shows the text as it is
+  heard, settled words in full and words still being revised underlined,
+  after a faint tail of the draft before the caret. Its text box grows a line
+  at a time up to three and never shrinks while recording, so the terminal
+  above resizes at most twice; longer text scrolls. Below it are the level
+  and time, Stop, and Send.
+- **The draft still takes the text once.** Stop settles the last words and
+  inserts the text at the caret, as ADR 0036 does for an upload. Send does
+  the same, then sends the draft through the Composer's own Send, so its
+  refusals stay where they are. There is no Cancel: unwanted words are
+  deleted from the draft like typed ones. Every other ending — the time
+  limit, a call, an engine error, leaving the screen — lands what was heard
+  and leaves recording mode without a notice. Only a recording that could
+  not start, or heard nothing, shows a failure in the recorder, with its fix:
+  Settings, a model download in place, or Try Again.
 - **One capture for every service.** `AVAudioEngine`'s input tap is converted
   to 16 kHz mono 16-bit PCM, the format the dictation model asks for and the
   speech services take as WAV. The same audio feeds the device's model as it
@@ -47,9 +55,12 @@ rejection of live partials; the rest of ADR 0036 stands.
 
 ## Considered Options
 
-- **Partials in a preview, the draft taking the text once**: rejected. The
-  recording bar is one line, and the risks that ADR 0036 named are handled
-  by refusing typing and holding the height.
+- **Text written into the draft as it is heard**: rejected. The editor would
+  have to refuse typing and hold its height to keep ADR 0036's rules, and a
+  recorder in the input's place shows the same text with neither.
+- **A fixed-height recorder**: rejected. Short prompts would leave empty
+  lines, and folding from one line to a tall recorder moves the terminal
+  further than growing does.
 - **Two transcribers in parallel, one per language**: not now. iOS allows
   about two recognition instances and offers no way to merge them; a single
   Chinese locale already carries English words.

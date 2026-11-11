@@ -9,7 +9,7 @@ Entries reference the pull request that made the change.
 
 ### Added
 
-- Turn speech into text on the device with Voice Input's On Device service, from iOS 26. Text appears in the draft as you speak and settles when you stop; Cancel takes it back. It needs no API key, listens for one chosen language with English words inside it, and uses your Keywords as hints. Its speech model downloads from Settings › Voice Input.
+- Turn speech into text on the device with Voice Input's On Device service, from iOS 26. While you speak, the Composer becomes a recorder outlined in red that shows the text as it is heard; Stop puts it in the draft and Send sends the draft with it. It needs no API key, listens for one chosen language with English words inside it, and uses your Keywords as hints. Its speech model downloads from Settings › Voice Input, or from the recorder when it is missing.
 - Open an image you sent to Claude Code or Codex by tapping its `[Image #N]` in your message, or with Preview Image in the message's menu, when it was pasted from a file, as Heeler's attached images are. (PR #674)
 - Read Heeler in Traditional Chinese (Taiwan). On a Traditional Chinese device, or with Traditional Chinese chosen as Heeler's language, everything Japanese and Simplified Chinese cover presents in Traditional Chinese, permission prompts included. (PR #668)
 - Read Heeler in Simplified Chinese. On a Simplified Chinese device, or with Simplified Chinese chosen as Heeler's language, everything Japanese covers presents in Chinese, permission prompts included. (PR #662)

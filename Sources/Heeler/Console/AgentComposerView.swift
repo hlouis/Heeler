@@ -333,7 +333,7 @@ struct AgentComposerView: View {
 
                 VStack(spacing: 0) {
                     inputArea
-                        .modifier(ComposerInputReplacement(replacement: inputReplacement))
+                        .modifier(ComposerInputReplacement(replacement: inputReplacement ?? liveVoiceRecorder))
                         .padding(inputAreaInsets)
 
                     TerminalAgentSwitcherRow(
@@ -361,7 +361,7 @@ struct AgentComposerView: View {
                 }
                 .overlay {
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(composerCardStroke, lineWidth: dropHighlight.strokeWidth)
+                        .stroke(composerCardStroke, lineWidth: composerCardStrokeWidth)
                 }
                 .overlay(alignment: .top) { keyboardGrabber }
                 .composerDropDestination(
@@ -396,7 +396,15 @@ struct AgentComposerView: View {
         }
         .onChange(of: focusRequest) { _, _ in
             // A card still in the input's place keeps the keyboard down.
-            if inputReplacement == nil { isInputFocused = true }
+            if inputReplacement == nil, liveVoiceRecorder == nil { isInputFocused = true }
+        }
+        // The recorder takes the input's place, so the keyboard has nothing
+        // to type into.
+        .onChange(of: store.voice.showsRecorder) { _, shows in
+            if shows { hideKeyboard() }
+        }
+        .onChange(of: store.voiceSendRequests) { _, _ in
+            sendDraft()
         }
         .onChange(of: isInputFocused) { _, isFocused in
             keyboardPresentationFollowsFocus(isFocused)
@@ -534,7 +542,6 @@ struct AgentComposerView: View {
                     isFocused: inputFocus,
                     keyboardPresentation: keyboardPresentation,
                     lineLimit: isCollapsed ? 1 : 5,
-                    isVoiceWriting: store.voice.locksDraft,
                     keyboardHandoffID: keyboardHandoffID,
                     isKeyboardHandoffCurrent: isKeyboardHandoffCurrent,
                     onFirstResponderRequest: onFirstResponderRequest,
@@ -735,7 +742,7 @@ struct AgentComposerView: View {
     }
 
     private var voiceBar: some View {
-        ComposerVoiceBar(voice: store.voice, showsLiveText: coversEditorRow) { store.voice.cancel() }
+        ComposerVoiceBar(voice: store.voice) { store.voice.cancel() }
     }
 
     /// Why Send waits; its VoiceOver hint already says so.
@@ -819,8 +826,25 @@ struct AgentComposerView: View {
             isInputFocused: isInputFocused,
             keyboardPresentation: keyboardPresentation,
             inheritsKeyboard: inheritsPendingKeyboard,
-            hasInputReplacement: inputReplacement != nil,
+            hasInputReplacement: inputReplacement != nil || liveVoiceRecorder != nil,
             keyboardIsLeaving: keyboardIsLeaving)
+    }
+
+    /// On Device Voice Input in the input's place, from the first tap until
+    /// its text lands in the draft (ADR 0043).
+    private var liveVoiceRecorder: AnyView? {
+        guard let voiceInput, inputMode == .composer, store.voice.showsRecorder else { return nil }
+        let caret = min(store.draftSelection.location, (store.draft as NSString).length)
+        return AnyView(
+            ComposerLiveVoiceRecorder(
+                voice: store.voice,
+                draftBeforeCaret: (store.draft as NSString).substring(to: caret),
+                draftHasText: store.draft.contains(where: { !$0.isWhitespace }),
+                stop: { voiceInput.stop(store.voice) },
+                send: { voiceInput.stop(store.voice, sending: true) },
+                downloadModel: { voiceInput.downloadModel(store.voice) },
+                restart: { voiceInput.start(store.voice) },
+                openVoiceInputSettings: { isVoiceSetupPresented = true }))
     }
 
     /// A keyboard handed over by the screen this one replaces, read without
@@ -977,10 +1001,16 @@ struct AgentComposerView: View {
         ComposerDropHighlight(isTargeted: isDropTargeted)
     }
 
+    /// Red while On Device records, so recording mode reads at a glance.
     private var composerCardStroke: Color {
-        dropHighlight.usesAccentStroke
+        if store.voice.isInRecordingMode { return Color(uiColor: .systemRed) }
+        return dropHighlight.usesAccentStroke
             ? Color.accentColor.opacity(0.72)
             : Color.secondary.opacity(0.16)
+    }
+
+    private var composerCardStrokeWidth: CGFloat {
+        store.voice.isInRecordingMode ? 1.5 : dropHighlight.strokeWidth
     }
 
 }
@@ -1114,7 +1144,7 @@ struct AgentComposerSendButton: View {
     }
 }
 
-private struct AgentComposerSendButtonStyle: ButtonStyle {
+struct AgentComposerSendButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
@@ -1209,10 +1239,6 @@ private struct AgentComposerTextEditor: UIViewRepresentable {
     /// How many lines show before the draft scrolls; one folds it to its
     /// first line.
     let lineLimit: Int
-    /// Voice Input writes into the draft as it is heard: typing is refused,
-    /// so the text it replaces stays put, and the height holds, so the
-    /// terminal above keeps its size (ADR 0043).
-    let isVoiceWriting: Bool
     let keyboardHandoffID: UUID?
     let isKeyboardHandoffCurrent: (UUID) -> Bool
     let onFirstResponderRequest: (UUID, Bool) -> Void
@@ -1250,14 +1276,11 @@ private struct AgentComposerTextEditor: UIViewRepresentable {
     func updateUIView(_ textView: AgentComposerUITextView, context: Context) {
         context.coordinator.onEdit = onEdit
         context.coordinator.onComposingChange = onComposingChange
-        context.coordinator.refusesTyping = isVoiceWriting
-        textView.holdHeight(isVoiceWriting, lineLimit: lineLimit)
         if textView.text != text {
             textView.text = text
         }
         if textView.selectedRange != selectedRange {
             textView.selectedRange = selectedRange
-            if isVoiceWriting { textView.scrollRangeToVisible(selectedRange) }
         }
         textView.updateLineLimit(lineLimit)
         textView.updateKeyboard(presentation: keyboardPresentation)
@@ -1312,8 +1335,8 @@ private struct AgentComposerTextEditor: UIViewRepresentable {
         let maximumHeight = uiView.draftLineHeight * CGFloat(lineLimit)
             + uiView.textContainerInset.top
             + uiView.textContainerInset.bottom
-        let height = uiView.heldHeight ?? min(max(36, measured.height), maximumHeight)
-        uiView.isScrollEnabled = lineLimit > 1 && measured.height > height
+        let height = min(max(36, measured.height), maximumHeight)
+        uiView.isScrollEnabled = lineLimit > 1 && measured.height > maximumHeight
         return CGSize(width: width, height: height)
     }
 
@@ -1324,9 +1347,6 @@ private struct AgentComposerTextEditor: UIViewRepresentable {
         /// The latest focus intent, from either SwiftUI or UIKit, so a
         /// deferred focus change can recheck it before acting.
         var wantsFocus = false
-        /// Voice Input is writing; the keyboard stays, but nothing it
-        /// types lands.
-        var refusesTyping = false
         private var isFocused: Binding<Bool>
         private var foldedSelection: NSRange?
 
@@ -1356,8 +1376,7 @@ private struct AgentComposerTextEditor: UIViewRepresentable {
             shouldChangeTextIn _: NSRange,
             replacementText text: String
         ) -> Bool {
-            guard !refusesTyping else { return false }
-            return (textView as? AgentComposerUITextView)?.acceptsReplacement(text) ?? true
+            (textView as? AgentComposerUITextView)?.acceptsReplacement(text) ?? true
         }
 
         /// A tap into the folded input lands in the one line it shows; the
@@ -1431,25 +1450,6 @@ final class AgentComposerUITextView: UITextView {
     /// inherited keyboard the same way from `didMoveToWindow`.
     var claimsKeyboardWhenReady = false
     private var laidOutHeight: CGFloat = 0
-    /// The height laid out when Voice Input began writing, kept until it
-    /// ends; the text scrolls inside it meanwhile.
-    private(set) var heldHeight: CGFloat?
-    /// Folding or unfolding resizes the Composer anyway, so the hold starts
-    /// over at the new size.
-    private var heldLineLimit: Int?
-
-    func holdHeight(_ holds: Bool, lineLimit: Int) {
-        guard holds, heldLineLimit == nil || heldLineLimit == lineLimit else {
-            heldHeight = nil
-            heldLineLimit = nil
-            return
-        }
-        if heldHeight == nil, bounds.height > 0 {
-            heldHeight = bounds.height
-            heldLineLimit = lineLimit
-        }
-    }
-
     /// Sends the draft for a hardware Return, the way the Send button does.
     var onHardwareReturn: (() -> Void)?
     /// Stages the clipboard's image. A text view takes only text, so without it a

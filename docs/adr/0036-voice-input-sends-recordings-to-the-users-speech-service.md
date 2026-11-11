@@ -5,8 +5,9 @@ status: accepted
 # Voice Input sends recordings to the user's speech service
 
 Amended by [ADR 0043](0043-voice-input-transcribes-on-device-as-it-is-heard.md):
-On Device writes text into the draft as it is heard, capture is one
-in-memory `AVAudioEngine` tap, and the session mixes with other audio.
+On Device shows its text in a recorder in the input's place as it is heard,
+capture is one in-memory `AVAudioEngine` tap, and the session mixes with
+other audio.
 
 [ADR 0003](0003-ios26-speechanalyzer-dictation.md) chose on-device
 SpeechAnalyzer dictation because "nothing I say to my Agents ever leaves the
