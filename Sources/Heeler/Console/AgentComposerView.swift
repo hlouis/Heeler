@@ -406,6 +406,11 @@ struct AgentComposerView: View {
         .onChange(of: store.voiceSendRequests) { _, _ in
             sendDraft()
         }
+        .onChange(of: store.voiceFocusRequests) { _, _ in
+            guard inputReplacement == nil else { return }
+            setKeyboardPresentation(.system)
+            isInputFocused = true
+        }
         .onChange(of: isInputFocused) { _, isFocused in
             keyboardPresentationFollowsFocus(isFocused)
         }
