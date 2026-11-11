@@ -68,7 +68,7 @@ struct VoiceInputSessionTests {
         defer { fixture.tearDown() }
         let hold = ScriptedTransportCallGate()
         let store = fixture.makeStore(holdGate: hold)
-        store.replaceDraft(with: "fix")
+        store.applyEditorDraft("fix. Then commit", selection: NSRange(location: 4, length: 0))
 
         fixture.session.toggle(store.voice)
         #expect(store.voice.showsRecorder)
@@ -81,13 +81,17 @@ struct VoiceInputSessionTests {
         fixture.live.hear(VoiceHeard(settled: "the ", revising: "use"))
         fixture.live.hear(VoiceHeard(settled: "the useEffect ", revising: "hook"))
         #expect(store.voice.heard.text == "the useEffect hook")
-        #expect(store.draft == "fix", "the draft waits for the text to settle")
+        #expect(store.draft == "fix. Then commit", "the draft waits for the text to settle")
         #expect(!store.canSend)
 
-        fixture.live.finalText = "the useEffect hook."
+        fixture.live.finalText = "Look at the useEffect hook."
         fixture.session.stop(store.voice)
         try await waitUntil("settled") { store.voice.phase == .idle }
-        #expect(store.draft == "fix the useEffect hook.")
+        #expect(store.draft == "fix. Look at the useEffect hook. Then commit", "the text lands at the caret")
+        #expect(
+            store.draftSelection == NSRange(location: (store.draft as NSString).length, length: 0),
+            "the caret goes after all the text")
+        #expect(store.voiceFocusRequests == 1)
         #expect(!store.voice.showsRecorder)
         #expect(store.voiceSendRequests == 0)
         #expect(await fixture.transcriber.requests.isEmpty, "nothing is uploaded")
@@ -107,6 +111,7 @@ struct VoiceInputSessionTests {
         fixture.session.stop(store.voice, sending: true)
         #expect(store.voice.sendsWhenSettled)
         try await waitUntil("sent") { store.voiceSendRequests == 1 }
+        #expect(store.voiceFocusRequests == 0, "Send leaves the keyboard down")
         #expect(store.draft == "run the tests")
         #expect(store.voice.phase == .idle)
         #expect(store.canSend, "no hold: the user asked to send")
