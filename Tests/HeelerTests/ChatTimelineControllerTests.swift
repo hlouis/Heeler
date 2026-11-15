@@ -1720,6 +1720,261 @@ struct ChatTimelineControllerTests {
         }
     }
 
+    @Test func jumpingToPreviousUserMessageStepsThroughPromptsAndUserCommandsThenStopsAtOldest() async throws {
+        var availability: [Bool] = []
+        let controller = ChatTimelineController(actions: ChatTimelineActions(
+            previousMessageAvailabilityChanged: { availability.append($0) }))
+        let longReply = String(repeating: "Detailed explanation line that fills vertical space in the timeline.\n\n", count: 28)
+        let entries: [ChatEntry] = [
+            ChatEntry(id: ChatEntryID("u0"), sourceOffset: 0, content: .user(ChatUserMessage(text: "First prompt"))),
+            ChatEntry(id: ChatEntryID("a0"), sourceOffset: 1, content: .assistant(ChatAssistantMessage(text: longReply))),
+            ChatEntry(
+                id: ChatEntryID("cmd1"), sourceOffset: 2,
+                content: .notice(ChatNotice(kind: .shellCommand, title: "git status"))),
+            ChatEntry(id: ChatEntryID("a1"), sourceOffset: 3, content: .assistant(ChatAssistantMessage(text: longReply))),
+            ChatEntry(
+                id: ChatEntryID("sys"), sourceOffset: 4,
+                content: .notice(ChatNotice(kind: .system, title: "Context compacted"))),
+            ChatEntry(id: ChatEntryID("u2"), sourceOffset: 5, content: .user(ChatUserMessage(text: "Latest prompt"))),
+            ChatEntry(id: ChatEntryID("a2"), sourceOffset: 6, content: .assistant(ChatAssistantMessage(text: longReply))),
+        ]
+        let rows = await ChatRowBuilder().rows(for: ChatTimelineInput(entries: entries))
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(rows))
+            await Self.settle(controller)
+            let view = controller.timeline
+            #expect(controller.isFollowing)
+            #expect(controller.canJumpToPreviousUserMessage)
+            #expect(availability == [true])
+
+            // First jump lands on u2, pushed above the viewport by a2.
+            controller.jumpToPreviousUserMessage()
+            await Self.settle(controller)
+            #expect(!controller.isFollowing)
+            #expect(controller.canJumpToPreviousUserMessage)
+            let u2Top = try #require(controller.cellFrame(of: .entry(ChatEntryID("u2")))).minY + 16
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - u2Top) <= 1)
+
+            // Second jump skips the system notice and lands on the user shell command.
+            controller.jumpToPreviousUserMessage()
+            await Self.settle(controller)
+            #expect(controller.canJumpToPreviousUserMessage)
+            let cmdTop = try #require(controller.cellFrame(of: .entry(ChatEntryID("cmd1")))).minY + 16
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - cmdTop) <= 1)
+
+            // Third jump lands on u0 at the top; no earlier user message remains.
+            controller.jumpToPreviousUserMessage()
+            await Self.settle(controller)
+            #expect(!controller.canJumpToPreviousUserMessage)
+            #expect(availability == [true, false])
+            #expect(abs(view.contentOffset.y - view.minOffsetY) <= 1)
+
+            // Jump to Latest returns directly to the bottom and re-offers Earlier Message.
+            controller.jumpToLatest()
+            await Self.settle(controller)
+            #expect(controller.isFollowing)
+            #expect(abs(view.contentOffset.y - view.maxOffsetY) <= 0.5)
+            #expect(controller.canJumpToPreviousUserMessage)
+            #expect(availability == [true, false, true])
+        }
+    }
+
+    @Test func shortConversationHidesPreviousMessageJumpUntilRepliesPushPromptOffScreen() async throws {
+        var availability: [Bool] = []
+        let controller = ChatTimelineController(actions: ChatTimelineActions(
+            previousMessageAvailabilityChanged: { availability.append($0) }))
+        let builder = ChatRowBuilder()
+        let shortEntries: [ChatEntry] = [
+            ChatEntry(id: ChatEntryID("u0"), sourceOffset: 0, content: .user(ChatUserMessage(text: "Short question"))),
+            ChatEntry(id: ChatEntryID("a0"), sourceOffset: 1, content: .assistant(ChatAssistantMessage(text: "Short answer."))),
+        ]
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(await builder.rows(for: ChatTimelineInput(entries: shortEntries))))
+            await Self.settle(controller)
+            #expect(controller.isFollowing)
+            #expect(!controller.canJumpToPreviousUserMessage)
+            #expect(availability.isEmpty)
+
+            let longEntries = shortEntries + [
+                ChatEntry(id: ChatEntryID("u1"), sourceOffset: 2, content: .user(ChatUserMessage(text: "Elaborate"))),
+                ChatEntry(
+                    id: ChatEntryID("a1"), sourceOffset: 3,
+                    content: .assistant(
+                        ChatAssistantMessage(
+                            text: String(repeating: "More detail that scrolls the earlier prompt above the screen.\n\n", count: 30)))),
+            ]
+            controller.apply(Self.state(await builder.rows(for: ChatTimelineInput(entries: longEntries)), revision: 2))
+            await Self.settle(controller)
+            #expect(controller.isFollowing)
+            #expect(controller.canJumpToPreviousUserMessage)
+            #expect(availability == [true])
+        }
+    }
+
+    @Test func rapidConsecutivePreviousMessageJumpsAdvanceWithoutWaitingForAnimationToSettle() async throws {
+        let controller = ChatTimelineController(actions: ChatTimelineActions())
+        let entries = Self.longAnswers(8)
+        let rows = await ChatRowBuilder().rows(for: ChatTimelineInput(entries: entries))
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(rows))
+            await Self.settle(controller)
+            let view = controller.timeline
+            let visibleTopAtEnd = view.contentOffset.y + view.adjustedContentInset.top
+            let offscreenPrompts = (0..<8).map { ChatRowID.entry(ChatEntryID("q\($0)")) }.filter { id in
+                guard let index = (0..<controller.geometry.count).first(where: {
+                    controller.visibleRowIDs.first != id && controller.geometry.minY(at: $0) >= 0 && rows[$0].id == id
+                }) else { return false }
+                let offset = index == 0 ? 0 : CGFloat(16)
+                return controller.geometry.minY(at: index) + offset < visibleTopAtEnd - 1
+            }
+            try #require(offscreenPrompts.count >= 3)
+            let thirdTarget = offscreenPrompts[offscreenPrompts.count - 3]
+
+            controller.jumpToPreviousUserMessage()
+            controller.jumpToPreviousUserMessage()
+            controller.jumpToPreviousUserMessage()
+            await Self.settle(controller)
+
+            #expect(!controller.isFollowing)
+            let frame = try #require(controller.cellFrame(of: thirdTarget))
+            let expectedTop = frame.minY + (thirdTarget == .entry(ChatEntryID("q0")) ? 0 : 16)
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - expectedTop) <= 1)
+        }
+    }
+
+    @Test func anUpdateDuringAPreviousMessageJumpStillLandsOnTargetAndHoldsIt() async throws {
+        let controller = ChatTimelineController(actions: ChatTimelineActions())
+        let builder = ChatRowBuilder()
+        let initial = Self.longAnswers(6)
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(await builder.rows(for: ChatTimelineInput(entries: initial))))
+            await Self.settle(controller)
+            // Jump across multiple screens so the upward animation is in flight when the update arrives.
+            controller.jumpToPreviousUserMessage()
+            controller.jumpToPreviousUserMessage()
+            try await Task.sleep(for: .milliseconds(25))
+
+            let grown = initial + [
+                ChatEntry(
+                    id: ChatEntryID("stream"), sourceOffset: 9_999,
+                    content: .assistant(ChatAssistantMessage(text: String(repeating: "Streaming line.\n", count: 20)))),
+            ]
+            controller.apply(Self.state(await builder.rows(for: ChatTimelineInput(entries: grown)), revision: 2))
+            await Self.settle(controller)
+
+            let view = controller.timeline
+            #expect(!controller.isFollowing)
+            #expect(view.contentOffset.y < view.maxOffsetY - view.bounds.height)
+            let firstVisible = try #require(controller.visibleRowIDs.first)
+            if firstVisible != .entry(ChatEntryID("q0")) {
+                let top = try #require(controller.cellFrame(of: firstVisible)).minY + 16
+                #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - top) <= 1)
+            }
+        }
+    }
+
+    @Test func jumpControlClearanceKeepsNewestRowClearOnlyWhenEarlierMessageShowsAtEnd() async throws {
+        let controller = ChatTimelineController(actions: ChatTimelineActions())
+        let builder = ChatRowBuilder()
+        let clearance: CGFloat = 44
+        let shortEntries: [ChatEntry] = [
+            ChatEntry(id: ChatEntryID("u0"), sourceOffset: 0, content: .user(ChatUserMessage(text: "Hi"))),
+            ChatEntry(id: ChatEntryID("a0"), sourceOffset: 1, content: .assistant(ChatAssistantMessage(text: "Hello!"))),
+        ]
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.setJumpControlClearance(clearance)
+            controller.apply(Self.state(await builder.rows(for: ChatTimelineInput(entries: shortEntries))))
+            await Self.settle(controller)
+            let view = controller.timeline
+            #expect(!controller.canJumpToPreviousUserMessage)
+            #expect(view.contentInset.bottom == 12)
+
+            let (longRows, turns) = await Self.turns(0..<6, steps: 4)
+            controller.apply(ChatTimelineState(
+                generation: 2, revision: 1, rows: longRows, isReady: true, turns: turns,
+                signals: ChatTurnSignals(activity: .idle)))
+            await Self.settle(controller)
+            #expect(controller.canJumpToPreviousUserMessage)
+            #expect(controller.isFollowing)
+            let newest = try #require(controller.cellFrame(of: .entry(ChatEntryID("a5"))))
+            #expect(newest.maxY - view.contentOffset.y <= view.bounds.height - 12 - clearance + 1)
+        }
+    }
+
+    @Test func nextUserMessageStepsForwardThroughPromptsAndCommandsThenReturnsToLatest() async throws {
+        let controller = ChatTimelineController(actions: ChatTimelineActions())
+        let longReply = String(repeating: "Detailed explanation line that fills vertical space in the timeline.\n\n", count: 28)
+        let entries: [ChatEntry] = [
+            ChatEntry(id: ChatEntryID("u0"), sourceOffset: 0, content: .user(ChatUserMessage(text: "First prompt"))),
+            ChatEntry(id: ChatEntryID("a0"), sourceOffset: 1, content: .assistant(ChatAssistantMessage(text: longReply))),
+            ChatEntry(
+                id: ChatEntryID("cmd1"), sourceOffset: 2,
+                content: .notice(ChatNotice(kind: .shellCommand, title: "git status"))),
+            ChatEntry(id: ChatEntryID("a1"), sourceOffset: 3, content: .assistant(ChatAssistantMessage(text: longReply))),
+            ChatEntry(id: ChatEntryID("u2"), sourceOffset: 4, content: .user(ChatUserMessage(text: "Latest prompt"))),
+            ChatEntry(id: ChatEntryID("a2"), sourceOffset: 5, content: .assistant(ChatAssistantMessage(text: longReply))),
+        ]
+        let rows = await ChatRowBuilder().rows(for: ChatTimelineInput(entries: entries))
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(rows))
+            await Self.settle(controller)
+            let view = controller.timeline
+
+            // Long-press Up jumps straight to the top (u0).
+            controller.jumpToTop()
+            await Self.settle(controller)
+            #expect(!controller.isFollowing)
+            #expect(!controller.canJumpToPreviousUserMessage)
+            #expect(abs(view.contentOffset.y - view.minOffsetY) <= 1)
+
+            // Tap Down once -> steps forward to cmd1.
+            controller.jumpToNextUserMessage()
+            await Self.settle(controller)
+            #expect(!controller.isFollowing)
+            #expect(controller.canJumpToPreviousUserMessage)
+            let cmdTop = try #require(controller.cellFrame(of: .entry(ChatEntryID("cmd1")))).minY + 16
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - cmdTop) <= 1)
+
+            // Tap Down again -> steps forward to u2.
+            controller.jumpToNextUserMessage()
+            await Self.settle(controller)
+            #expect(!controller.isFollowing)
+            let u2Top = try #require(controller.cellFrame(of: .entry(ChatEntryID("u2")))).minY + 16
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - u2Top) <= 1)
+
+            // Tap Down when no newer user message remains -> finishes at the bottom and resumes following.
+            controller.jumpToNextUserMessage()
+            await Self.settle(controller)
+            #expect(controller.isFollowing)
+            #expect(abs(view.contentOffset.y - view.maxOffsetY) <= 0.5)
+        }
+    }
+
+    @Test func rapidConsecutiveNextMessageJumpsAdvanceWithoutWaitingForAnimationToSettle() async throws {
+        let controller = ChatTimelineController(actions: ChatTimelineActions())
+        let entries = Self.longAnswers(8)
+        let rows = await ChatRowBuilder().rows(for: ChatTimelineInput(entries: entries))
+        try await withTestWindow(frame: Self.frame, rootViewController: controller) { _ in
+            controller.apply(Self.state(rows))
+            await Self.settle(controller)
+            let view = controller.timeline
+
+            controller.jumpToTop()
+            await Self.settle(controller)
+            #expect(abs(view.contentOffset.y - view.minOffsetY) <= 1)
+
+            // Three rapid taps from q0 advance through q1 -> q2 -> q3 without waiting.
+            controller.jumpToNextUserMessage()
+            controller.jumpToNextUserMessage()
+            controller.jumpToNextUserMessage()
+            await Self.settle(controller)
+
+            #expect(!controller.isFollowing)
+            let q3Top = try #require(controller.cellFrame(of: .entry(ChatEntryID("q3")))).minY + 16
+            #expect(abs((view.contentOffset.y + view.adjustedContentInset.top) - q3Top) <= 1)
+        }
+    }
+
     // MARK: Helpers
 
     private static func foldState(
@@ -2258,6 +2513,168 @@ struct ChatRowViewTests {
         let ran = ChatToolActivity(kind: .command, name: "Bash", title: "true", status: .succeeded)
         let ranLabels = try await Self.labels(of: ran, isExpanded: true)
         #expect(ranLabels.contains { $0.contains("No output.") }, "\(ranLabels)")
+    }
+
+    @Test func inlineRowsShareAlignedIconColumnAndDetailIndent() async throws {
+        let width: CGFloat = 402
+        let scale: CGFloat = 2
+        let cases: [(name: String, content: ChatRow.Content)] = [
+            ("reasoning", .reasoning(ChatReasoning(text: "Thought"))),
+            ("command", .tool(ChatToolActivity(kind: .command, name: "Bash", title: "echo ok", status: .succeeded))),
+            ("fileRead", .tool(ChatToolActivity(kind: .fileRead, name: "Read", title: "README.md", status: .succeeded))),
+            ("fileEdit", .tool(ChatToolActivity(kind: .fileEdit, name: "Edit", title: "README.md", status: .succeeded))),
+            ("agent", .tool(ChatToolActivity(kind: .agent, name: "Agent", title: "Explore codebase", status: .succeeded))),
+            ("question", .tool(ChatToolActivity(kind: .question, name: "AskUserQuestion", title: "Which option?", status: .succeeded))),
+            (
+                "toolGroup",
+                .toolGroup(
+                    ChatToolGroup(
+                        summary: "Ran 2 commands", kind: .command, added: nil, removed: nil, failed: 0,
+                        isRunning: false, calls: 2, isOpen: false))
+            ),
+            ("notice", .notice(ChatNotice(kind: .taskNotification, title: "Background command finished"))),
+        ]
+
+        var singleLineHeights: [CGFloat] = []
+        let expectedCenter = ChatTimelineMetrics.horizontalPadding + ChatTimelineMetrics.inlineIconColumnWidth / 2
+        for item in cases {
+            let row = ChatRow(id: .entry(ChatEntryID(item.name)), content: item.content, revision: 1, topSpacing: 0)
+            let (image, height, _) = try await Self.renderRow(row, width: width, scale: scale)
+            singleLineHeights.append(height)
+            let bounds = try #require(
+                Self.inkBounds(in: image, xRange: 0..<35, yRange: 0..<height, scale: scale),
+                "Expected icon ink for \(item.name)")
+            let midX = (bounds.minX + bounds.maxX) / 2
+            let dominantSize = max(bounds.width, bounds.height)
+            #expect(abs(midX - expectedCenter) <= 1.2, "\(item.name) icon midX \(midX) != \(expectedCenter)")
+            #expect(bounds.minX >= 15.5 && bounds.maxX <= 34.5, "\(item.name) icon overflowed column: \(bounds)")
+            #expect(
+                (11.0...15.5).contains(dominantSize),
+                "\(item.name) icon dominant size \(dominantSize) outside 11...15.5pt (bounds: \(bounds))")
+        }
+
+        let baselineHeight = try #require(singleLineHeights.first)
+        for (item, height) in zip(cases, singleLineHeights) {
+            #expect(abs(height - baselineHeight) <= 1, "\(item.name) height \(height) != \(baselineHeight)")
+        }
+
+        let detailedNotice = ChatRow(
+            id: .entry(ChatEntryID("notice-detail")),
+            content: .notice(
+                ChatNotice(
+                    kind: .taskNotification, title: "Background command finished", detail: "python3 -c 'print(0)'")),
+            revision: 1, topSpacing: 0)
+        let titleOnlyHeight = try #require(singleLineHeights.last)
+        let (detailImage, detailHeight, labels) = try await Self.renderRow(detailedNotice, width: width, scale: scale)
+        #expect(detailHeight > titleOnlyHeight)
+        let indentEdge = ChatTimelineMetrics.horizontalPadding + ChatTimelineMetrics.inlineDetailLeadingIndent - 1
+        #expect(
+            Self.inkBounds(in: detailImage, xRange: 0..<indentEdge, yRange: titleOnlyHeight..<detailHeight, scale: scale)
+                == nil,
+            "Notice detail leaked left of \(indentEdge)pt")
+        #expect(
+            Self.inkBounds(
+                in: detailImage, xRange: indentEdge..<width, yRange: titleOnlyHeight..<detailHeight, scale: scale)
+                != nil,
+            "Expected notice detail ink to the right of \(indentEdge)pt")
+        #expect(
+            labels.contains { $0.contains("Background command finished") && $0.contains("python3 -c 'print(0)'") },
+            "\(labels)")
+        #expect(!labels.contains { $0.localizedCaseInsensitiveContains("bell") }, "\(labels)")
+    }
+
+    private struct InkBounds {
+        let minX: CGFloat
+        let maxX: CGFloat
+        let minY: CGFloat
+        let maxY: CGFloat
+
+        var width: CGFloat { maxX - minX }
+        var height: CGFloat { maxY - minY }
+    }
+
+    private static func renderRow(
+        _ row: ChatRow, width: CGFloat, scale: CGFloat
+    ) async throws -> (image: CGImage, height: CGFloat, labels: [String]) {
+        let content = ChatRowView(row: row, isExpanded: false, actions: Self.actions)
+            .frame(width: width)
+            .fixedSize(horizontal: false, vertical: true)
+        let sizer = UIHostingController(rootView: content)
+        let fittedHeight = sizer.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        let hostHeight = max(fittedHeight, 44)
+        let controller = UIHostingController(
+            rootView: content
+                .frame(width: width, height: hostHeight, alignment: .topLeading)
+                .background(Color(uiColor: .systemBackground)))
+        controller.safeAreaRegions = []
+        controller.view.backgroundColor = .systemBackground
+        var rendered: UIImage?
+        var labels: [String] = []
+        try await withTestWindow(
+            frame: CGRect(x: 0, y: 0, width: width, height: hostHeight), rootViewController: controller
+        ) { _ in
+            controller.view.layoutIfNeeded()
+            labels = AccessibilityProbe.labels(in: controller.view)
+            let format = UIGraphicsImageRendererFormat()
+            format.opaque = true
+            format.scale = scale
+            rendered = UIGraphicsImageRenderer(bounds: controller.view.bounds, format: format).image { _ in
+                controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+            }
+        }
+        let cgImage = try #require(rendered?.cgImage)
+        return (cgImage, fittedHeight, labels)
+    }
+
+    private static func inkBounds(
+        in image: CGImage, xRange: Range<CGFloat>, yRange: Range<CGFloat>, scale: CGFloat
+    ) -> InkBounds? {
+        let pixelWidth = image.width
+        let pixelHeight = image.height
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        var rgba = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
+        let drawn = rgba.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: pixelWidth, height: pixelHeight,
+                bitsPerComponent: 8, bytesPerRow: pixelWidth * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+            return true
+        }
+        guard drawn else { return nil }
+        let bgR = Int(rgba[0])
+        let bgG = Int(rgba[1])
+        let bgB = Int(rgba[2])
+        let xStart = max(0, Int((xRange.lowerBound * scale).rounded(.down)))
+        let xEnd = min(pixelWidth, Int((xRange.upperBound * scale).rounded(.up)))
+        let yStart = max(0, Int((yRange.lowerBound * scale).rounded(.down)))
+        let yEnd = min(pixelHeight, Int((yRange.upperBound * scale).rounded(.up)))
+        guard xStart < xEnd, yStart < yEnd else { return nil }
+        var minPX = Int.max
+        var maxPX = Int.min
+        var minPY = Int.max
+        var maxPY = Int.min
+        for py in yStart..<yEnd {
+            for px in xStart..<xEnd {
+                let offset = (py * pixelWidth + px) * 4
+                let diff = max(
+                    abs(Int(rgba[offset]) - bgR),
+                    abs(Int(rgba[offset + 1]) - bgG),
+                    abs(Int(rgba[offset + 2]) - bgB))
+                if diff > 12 {
+                    minPX = min(minPX, px)
+                    maxPX = max(maxPX, px)
+                    minPY = min(minPY, py)
+                    maxPY = max(maxPY, py)
+                }
+            }
+        }
+        guard minPX <= maxPX else { return nil }
+        return InkBounds(
+            minX: CGFloat(minPX) / scale, maxX: CGFloat(maxPX + 1) / scale,
+            minY: CGFloat(minPY) / scale, maxY: CGFloat(maxPY + 1) / scale)
     }
 }
 

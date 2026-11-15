@@ -13,8 +13,8 @@ struct UsageMiscLocalizationTests {
 
     @Test(arguments: [
         AgentUsageExclusion.notConnected, .notReadYet, .usageOff, .needsPlugin, .unsupportedPlatform,
-        .needsHostHelper, .updateHostHelper, .waitingForCore, .repairHostHelper, .hostHelperNotOnWindows,
-        .noAgentActivity, .updateRequired, .readFailed,
+        .needsHostHelper, .updateHostHelper, .waitingForCore, .waitingForTmux, .repairHostHelper,
+        .hostHelperNotOnWindows, .noAgentActivity, .updateRequired, .readFailed,
     ])
     func everyExclusionRoundTripsThroughItsToken(_ exclusion: AgentUsageExclusion) throws {
         let token = try #require(exclusion.token)
@@ -64,8 +64,8 @@ struct UsageMiscLocalizationTests {
         #expect(AgentActivityCopy.count(2, status: "blocked") == "2 blocked")
         #expect(AgentActivityCopy.count(1, status: "done") == "1 done")
         #expect(AgentActivityCopy.count(3, status: "paused") == "3 paused")
-        #expect(AgentActivityCopy.status("working") == "working")
-        #expect(AgentActivityCopy.status("paused") == "paused")
+        #expect(AgentActivityCopy.lockScreenStatus("working") == "Working")
+        #expect(AgentActivityCopy.lockScreenStatus("paused") == "paused")
     }
 
     // MARK: Changes

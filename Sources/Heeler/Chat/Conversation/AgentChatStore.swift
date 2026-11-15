@@ -32,6 +32,8 @@ struct AgentChatSource: Sendable {
     var coreScope: String?
     /// Listing and confirming candidates, where a check can find nothing (ADR 0034).
     var picks: ChatPickIO?
+    /// Notifies listeners when an Antigravity CLI chat binds or resolves its root conversation.
+    var onAgyConversationBound: (@MainActor @Sendable (_ root: String?, _ rootID: String?) -> Void)? = nil
 }
 
 /// What a confirmed candidate goes through, keeping to the detail's core.
@@ -204,6 +206,9 @@ final class AgentChatStore {
     /// The Subagents and Workflows the conversation's program runs beside
     /// it, as last read.
     private(set) var backgroundWork = ChatBackgroundWork()
+    /// Codex's visible model catalog (`models_cache.json` on the Host, or
+    /// built-in presets before a cache file exists).
+    private(set) var codexModelCatalog = CodexModelCatalog.fallback
     /// A send the program recorded in another session, which holds every
     /// send until the user is back in this conversation. Only the prompt
     /// log sets it; what the screen shows is read afresh at each send.
@@ -413,6 +418,8 @@ final class AgentChatStore {
     @ObservationIgnored private var outputReads: [ChatEntryID: Task<Void, Never>] = [:]
     /// What each listed Workflow's journal showed, by the Workflow's id.
     @ObservationIgnored private var workflowProgress: [String: ChatWorkflowProgress] = [:]
+    @ObservationIgnored private var loadedCodexCatalogScope: String?
+    @ObservationIgnored private var codexCatalogTask: Task<Void, Never>?
 
     private struct TrackedSend {
         let id: UUID
@@ -507,6 +514,7 @@ final class AgentChatStore {
         isVisible = true
         needsAgentRefresh = true
         needsLaunchCheck = true
+        refreshCodexModelCatalogIfNeeded()
         startLoop()
         blocked.show()
     }
@@ -536,6 +544,7 @@ final class AgentChatStore {
         consecutiveAgentRefreshLinkFailures = 0
         needsAgentRefresh = true
         needsLaunchCheck = true
+        refreshCodexModelCatalogIfNeeded()
         startLoop()
         blocked.resume()
     }
@@ -654,6 +663,7 @@ final class AgentChatStore {
         guard isConnected else { return }
         // Whatever happened meanwhile sent no event this Chat saw.
         sessionEvidenceMayHaveChanged()
+        refreshCodexModelCatalogIfNeeded()
         let waiting = waitingOutputs
         for id in waiting {
             loadOutput(id)
@@ -684,6 +694,8 @@ final class AgentChatStore {
         failedOpens = 0
         screenCheckRequested = true
         needsLaunchCheck = true
+        loadedCodexCatalogScope = nil
+        refreshCodexModelCatalogIfNeeded()
         retryRequests += 1
         isRetrying = true
         wake()
@@ -1064,6 +1076,8 @@ final class AgentChatStore {
     }
 
     private func stopLoop() {
+        codexCatalogTask?.cancel()
+        codexCatalogTask = nil
         guard let loop else { return }
         loop.cancel()
         sleeper?.cancel()
@@ -1240,13 +1254,26 @@ final class AgentChatStore {
                 movedSinceDraft = true
                 draftAtMove = composerDraft
             }
+            if program == .agy {
+                source.onAgyConversationBound?(
+                    evidenceRoot ?? transcriptRoot,
+                    agyRootSessionID ?? followed?.sessionID ?? sessionID)
+            }
         case .picked(let sessionID, let transcriptRoot):
             followsPick = true
             adoptBinding(sessionID: sessionID, transcriptRoot: transcriptRoot, directory: nil)
+            if program == .agy {
+                source.onAgyConversationBound?(
+                    evidenceRoot ?? transcriptRoot,
+                    agyRootSessionID ?? followed?.sessionID ?? sessionID)
+            }
         case .unavailable(let reason):
             let leavesPick = followsPick
             forgetPick()
             evidenceReason = reason
+            if program == .agy {
+                source.onAgyConversationBound?(nil, nil)
+            }
             if leavesPick {
                 leavePickedConversation()
             } else {
@@ -1254,12 +1281,18 @@ final class AgentChatStore {
             }
         case .pickUnconfirmed(let reason):
             evidenceReason = reason
+            if program == .agy {
+                source.onAgyConversationBound?(nil, nil)
+            }
             awaitSession(reason)
         case .launching:
             // As before the first check, it stays looking.
             let leavesPick = followsPick
             forgetPick()
             evidenceReason = nil
+            if program == .agy {
+                source.onAgyConversationBound?(nil, nil)
+            }
             if leavesPick {
                 leavePickedConversation()
             } else if resolution != .noSession {
@@ -1297,7 +1330,35 @@ final class AgentChatStore {
         // The same id under another root is another file.
         let movedRoot = followed != nil && evidenceRoot != transcriptRoot
         evidenceRoot = transcriptRoot
+        refreshCodexModelCatalogIfNeeded()
         adopt(.bound(reference), replacingAgent: movedRoot)
+    }
+
+    private var codexCatalogScope: String {
+        source.sessionEvidence == nil ? "tui" : (evidenceRoot ?? "default")
+    }
+
+    func refreshCodexModelCatalogIfNeeded() {
+        guard program == .codex, isVisible, !isSuspended, isHostConnected else { return }
+        let scope = codexCatalogScope
+        guard loadedCodexCatalogScope != scope, codexCatalogTask == nil else { return }
+        let configRoot = source.sessionEvidence == nil ? nil : evidenceRoot
+        let files = source.files
+        codexCatalogTask = Task { [weak self] in
+            do {
+                let catalog = try await CodexModelCatalog.read(files: files, configRoot: configRoot)
+                guard let self, !Task.isCancelled else { return }
+                self.codexCatalogTask = nil
+                self.loadedCodexCatalogScope = scope
+                self.codexModelCatalog = catalog ?? .fallback
+                if self.codexCatalogScope != scope {
+                    self.refreshCodexModelCatalogIfNeeded()
+                }
+            } catch {
+                guard let self else { return }
+                self.codexCatalogTask = nil
+            }
+        }
     }
 
     /// Due while Chat shows the conversation, after anything that may mean
@@ -1405,7 +1466,7 @@ final class AgentChatStore {
             refreshBackgroundWork()
             return
         }
-        if !replacingAgent, program == .agy, agyRootSessionID != nil,
+        if !replacingAgent, source.sessionEvidence == nil, program == .agy, agyRootSessionID != nil,
             case .bound(let reference) = next, reference.program == .agy
         {
             if showsAwaitingReason {
@@ -1962,6 +2023,9 @@ final class AgentChatStore {
             if let followedID = followed?.sessionID { agySessionFamily.insert(followedID) }
             if case .bound(let reported) = resolution, reported.program == .agy {
                 agySessionFamily.insert(reported.sessionID)
+            }
+            if !next.isFromCache {
+                source.onAgyConversationBound?(AgyTranscriptLocator.root(ofTranscript: path), rootID)
             }
         }
         if case .following = next.phase, !waitingOutputs.isEmpty {

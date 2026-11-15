@@ -34,7 +34,7 @@ final class AgentComposerSession {
         stageImage: @escaping ImageStager,
         stageFile: @escaping FileStager,
         corePin: TerminalCorePin = TerminalCorePin(),
-        isOnCoreHost: Bool = false,
+        saysTransportFailures: Bool = false,
         filePreparer: any FilePreparing = FilePreparer(),
         sendAgentKeys: @escaping @MainActor ([String]) async throws -> Void = { _ in throw TransportError.cancelled }
     ) {
@@ -43,7 +43,7 @@ final class AgentComposerSession {
         agentKeys = ChatAgentKeysStore(send: sendAgentKeys)
         staging = ComposerStagingStore(
             filePreparer: filePreparer, stageImage: stageImage, stageFile: stageFile, composer: composer,
-            saysTransportFailures: isOnCoreHost)
+            saysTransportFailures: saysTransportFailures)
         composer.bindStaging(staging)
     }
 
@@ -61,14 +61,19 @@ final class AgentComposerSession {
     /// The terminal page's Send. `attach` is that window's Attach, which a
     /// herdr-core Send types into, since another window can show the same
     /// Agent's Composer.
-    func terminalSendPolicy(attach: AgentAttachStore?) -> ComposerDeliveryPolicy {
+    func terminalSendPolicy(attach: AgentAttachStore?, kind: String? = nil) -> ComposerDeliveryPolicy {
         var policy = ComposerDeliveryPolicy.terminal
         policy.coreAttach = attach
         let settings = settingOverrides
+        let isClaude = kind == nil || kind == "claude"
         policy.preflight = { [weak self] _ in
             if settings.switchingSetting != nil {
                 return .inputNotReady(
-                    String(localized: "Claude Code is reading or changing a setting. Try again in a moment."))
+                    isClaude
+                        ? String(localized: "Claude Code is reading or changing a setting. Try again in a moment.")
+                        : String(
+                            localized: "The Agent is reading or changing a setting. Try again in a moment.",
+                            comment: "Terminal input refusal while an Agent reads or changes a setting."))
             }
             return self?.heldSend()
         }
@@ -125,7 +130,7 @@ final class AgentSettingOverrides {
     enum Setting: Int { case permissionMode, model, effort }
 
     private var values: [String?] = [nil, nil, nil]
-    private var recorded: [String?] = [nil, nil, nil]
+    private var recorded: [Setting: [String?]] = [:]
     /// A switch's paste or key got no answer, so it may still reach the
     /// Agent's input; the next input waits until the Host answers a read.
     var lastSwitchHasNoAnswer = false
@@ -156,11 +161,17 @@ final class AgentSettingOverrides {
     }
 
     func value(_ setting: Setting, over now: [String?]) -> String? {
-        recorded[setting.rawValue] == now[setting.rawValue] ? values[setting.rawValue] : nil
+        guard let snapshot = recorded[setting], snapshot.count == now.count else { return nil }
+        switch setting {
+        case .permissionMode:
+            return snapshot.first == now.first ? values[setting.rawValue] : nil
+        case .model, .effort:
+            return Array(snapshot.dropFirst()) == Array(now.dropFirst()) ? values[setting.rawValue] : nil
+        }
     }
 
     func set(_ setting: Setting, _ value: String?, over now: [String?]) {
         values[setting.rawValue] = value
-        recorded[setting.rawValue] = now[setting.rawValue]
+        recorded[setting] = now
     }
 }

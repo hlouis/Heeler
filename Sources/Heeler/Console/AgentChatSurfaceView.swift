@@ -50,6 +50,10 @@ struct AgentChatSurfaceView: View {
     @State private var bottomChromeHeight: CGFloat = 0
     @State private var surfaceHeight: CGFloat = 0
     @State private var jumpRequest = 0
+    @State private var previousMessageRequest = 0
+    @State private var nextMessageRequest = 0
+    @State private var topJumpRequest = 0
+    @State private var canJumpToPreviousMessage = false
     @State private var followRequest = 0
     @State private var collapseRequest = 0
     @State private var canCollapseTrajectory = false
@@ -78,8 +82,12 @@ struct AgentChatSurfaceView: View {
         nonmutating set { session.settingOverrides.switchingSetting = newValue }
     }
     private var isSwitchingSetting: Bool { switchingSetting != nil }
-    /// A fresh Claude session has no reply yet; its welcome banner names the model.
+    /// A fresh Claude, Codex or Antigravity session has no reply yet; its screen names the model.
     @State private var welcomeModel: String?
+    @State private var welcomeEffort: String?
+    /// Antigravity CLI's model catalog on this Host (`agy models`).
+    @State private var agyModels: [AgyModelCatalog.Choice] = []
+    private var codexModelCatalog: CodexModelCatalog { chat?.codexModelCatalog ?? .fallback }
     @State private var isRenamingAgent = false
     @State private var titleRename: AgentTitleRenameStore?
     @State private var isRenamingWorkspace = false
@@ -98,6 +106,7 @@ struct AgentChatSurfaceView: View {
     @State private var mountedWindow = WindowReference()
     @State private var windowControlsHeight: CGFloat = 0
     @State private var checkAgain: ChatCheckAgainHold?
+    @State private var checkAgainTask: Task<Void, Never>?
     /// Shared with the terminal: one reading preference across surfaces.
     @AppStorage("agent.back-header-expanded") private var isBackHeaderExpanded = false
     @AppStorage(ChatFoldSettings.defaultsKey) private var foldsFinishedTurns = true
@@ -360,6 +369,7 @@ struct AgentChatSurfaceView: View {
                 chat?.hide(viewerID)
                 composer.voice.composerDidLeaveScreen()
                 answerSwitch(false)
+                cancelCheckAgain()
             }
         }
         .onChange(of: timelineFeed, initial: true) { _, feed in
@@ -386,6 +396,7 @@ struct AgentChatSurfaceView: View {
         .onChange(of: chat?.conversationGeneration, initial: true) { _, generation in
             guard let generation else { return }
             welcomeModel = nil
+            welcomeEffort = nil
             composer.conversationDidChange(to: generation)
         }
         .onChange(of: chat?.sendStatuses, initial: true) { _, statuses in
@@ -416,6 +427,14 @@ struct AgentChatSurfaceView: View {
         }
         .onChange(of: isHostConnected, initial: true) { _, isConnected in
             chat?.hostConnectionChanged(isConnected)
+        }
+        // The transcript records the mode as snapshots, and not every change
+        // (plan approval moves to auto unrecorded); the footer shows it live.
+        .task(id: "\(agent.agent.status)-\(chat?.conversationGeneration ?? 0)-\(console.hostConnectionGenerations[agent.hostID] ?? 0)-\(console.isHostReadyForInput(agent.hostID))") {
+            await readSessionSettingsFromScreen()
+        }
+        .task(id: "\(program)-\(console.hostConnectionGenerations[agent.hostID] ?? 0)-\(console.isHostReadyForInput(agent.hostID))") {
+            await loadAgyModels()
         }
     }
 
@@ -508,7 +527,11 @@ struct AgentChatSurfaceView: View {
             .padding(.horizontal, 12)
             .padding(.top, backHeaderTop)
             .onChange(of: isBackHeaderExpanded) { _, expanded in
-                if !expanded { isHeaderDrawerOpen = false }
+                if !expanded {
+                    isHeaderDrawerOpen = false
+                } else if (sessionSettings?.model ?? "").isEmpty {
+                    Task { await readSessionSettingsFromScreen() }
+                }
             }
         }
         .onWindowControlsHeightChange { windowControlsHeight = $0 }
@@ -551,12 +574,12 @@ struct AgentChatSurfaceView: View {
         .prioritizesVerticalDetailToolbar()
     }
 
-    /// Over the list's bottom edge, which keeps Collapse Steps' band clear
-    /// of rows while it shows.
+    /// Over the list's bottom edge, which keeps the floating controls' bottom
+    /// band clear of rows while either shows at the end.
     private var floatingTimelineControls: some View {
         // The buttons' hit areas reach past their circles, which already
         // leaves a gap between them.
-        HStack(spacing: 0) {
+        HStack(alignment: .bottom, spacing: 0) {
             Spacer(minLength: 0)
             ChatCollapseTrajectoryButton(
                 isVisible: presentation == .timeline && timeline.state.isReady && canCollapseTrajectory
@@ -564,25 +587,31 @@ struct AgentChatSurfaceView: View {
                 collapseRequest += 1
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { collapseControlHeight = $0 }
-            ChatJumpToLatestButton(
-                isVisible: presentation == .timeline && timeline.state.isReady && !isFollowing
-            ) {
-                jumpRequest += 1
-            }
+            ChatMessageJumpControl(
+                showsPrevious: presentation == .timeline && timeline.state.isReady && canJumpToPreviousMessage,
+                showsLatest: presentation == .timeline && timeline.state.isReady && !isFollowing,
+                jumpPrevious: { previousMessageRequest += 1 },
+                jumpTop: { topJumpRequest += 1 },
+                jumpNext: { nextMessageRequest += 1 },
+                jumpLatest: { jumpRequest += 1 })
         }
-        .chatContentColumn()
-        .padding(.trailing, edgeHandleReserve)
+        // Align the jump capsule's visible right edge with the status line's
+        // trailing latency caption (`ChatTimelineMetrics.horizontalPadding`).
+        .padding(.leading, ChatTimelineMetrics.horizontalPadding)
+        .padding(.trailing, max(0, ChatTimelineMetrics.horizontalPadding - ChatMessageJumpControl.hitInset))
+        .frame(maxWidth: ChatTimelineMetrics.maximumContentWidth)
+        .frame(maxWidth: .infinity)
         .onChange(of: workspaceDrawer != nil, initial: true) { _, offers in
             if offers, !hasOfferedWorkspaceDrawer { hasOfferedWorkspaceDrawer = true }
         }
     }
 
-    /// How much further than their own margin Chat's rows and floating
-    /// buttons keep from the trailing edge, for the Workspace terminals
-    /// handle resting there. Kept while the back header is out and the
-    /// handle hides, so folding the header does not re-measure every row,
-    /// and once offered, through a reconnect that empties the Workspace's
-    /// Terminals for a moment, so the rows do not re-wrap twice.
+    /// How much further than their own margin Chat's rows keep from the
+    /// trailing edge, for the Workspace terminals handle resting there. Kept
+    /// while the back header is out and the handle hides, so folding the
+    /// header does not re-measure every row, and once offered, through a
+    /// reconnect that empties the Workspace's Terminals for a moment, so the
+    /// rows do not re-wrap twice.
     private var edgeHandleReserve: CGFloat {
         guard workspaceDrawer != nil || hasOfferedWorkspaceDrawer else { return 0 }
         return max(0, WorkspaceTerminalDrawer.contentClearance - ChatTimelineMetrics.horizontalPadding)
@@ -594,11 +623,16 @@ struct AgentChatSurfaceView: View {
     private var conversation: some View {
         ZStack(alignment: .top) {
             ChatTimelineView(
-                state: timeline.state, jumpRequest: jumpRequest, followRequest: followRequest,
+                state: timeline.state, jumpRequest: jumpRequest,
+                previousMessageRequest: previousMessageRequest,
+                nextMessageRequest: nextMessageRequest,
+                topJumpRequest: topJumpRequest,
+                followRequest: followRequest,
                 collapseRequest: collapseRequest,
                 topObstruction: topInset + headerObstruction + bannerHeight,
                 bottomEdge: bottomEdge,
                 collapseControlClearance: collapseControlHeight,
+                jumpControlClearance: AgentDetailHeader.controlSize,
                 trailingReserve: edgeHandleReserve,
                 textSize: ChatTextSettings.size(system: dynamicTypeSize, offset: textSizeOffset),
                 font: chatFont,
@@ -633,7 +667,6 @@ struct AgentChatSurfaceView: View {
                 .padding(.top, headerObstruction)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .modifier(CheckAgainTiming(hold: $checkAgain, chat: chat))
         // Hung from the conversation's bottom edge down to the screen's, so
         // it never sizes the conversation: as a sibling it could outgrow the
         // room left above a raised keyboard, push the chrome down and the
@@ -828,17 +861,35 @@ struct AgentChatSurfaceView: View {
 
     private func startCheckAgain() {
         guard let chat, checkAgain == nil else { return }
+        if isOnStage() { chat.show(viewerID) }
+        let hold = ChatCheckAgainHold(presentation: presentation)
         withAnimation(ChatCheckAgainHold.animation) {
-            checkAgain = ChatCheckAgainHold(presentation: presentation)
+            checkAgain = hold
         }
         chat.retry()
+        // Run outside `.task(id:)`: SwiftUI can send a spurious `onDisappear`
+        // on iPhone without a matching `onAppear`, after which `.task` and
+        // `.onChange` stop running while Chat stays on stage.
+        checkAgainTask?.cancel()
+        checkAgainTask = Task { @MainActor in
+            await ChatCheckAgainHold.wait { !chat.isRetrying }
+            guard !Task.isCancelled, checkAgain?.id == hold.id else { return }
+            withAnimation(ChatCheckAgainHold.animation) { checkAgain = nil }
+            checkAgainTask = nil
+        }
+    }
+
+    private func cancelCheckAgain() {
+        checkAgainTask?.cancel()
+        checkAgainTask = nil
+        checkAgain = nil
     }
 
     /// Check Again's look: what Chat showed when it was tapped, held with
     /// the button busy until the store has looked again and the look has
     /// shown for `minimum`, so a quick answer doesn't cut it short. At
     /// `limit` the hold ends whatever the store is doing.
-    private struct ChatCheckAgainHold {
+    struct ChatCheckAgainHold {
         static let minimum: Duration = .milliseconds(800)
         static let limit: Duration = .seconds(8)
         /// Both into the look and out of it to the answer.
@@ -846,32 +897,20 @@ struct AgentChatSurfaceView: View {
 
         let id = UUID()
         let presentation: ChatSurfacePresentation
-        var hasShownMinimum = false
-    }
 
-    /// Ends Check Again's hold, easing to the answer.
-    private struct CheckAgainTiming: ViewModifier {
-        @Binding var hold: ChatCheckAgainHold?
-        let chat: AgentChatStore?
-
-        func body(content: Content) -> some View {
-            content
-                .task(id: hold?.id) {
-                    guard hold != nil else { return }
-                    try? await Task.sleep(for: ChatCheckAgainHold.minimum)
-                    guard !Task.isCancelled else { return }
-                    hold?.hasShownMinimum = true
-                    endIfAnswered()
-                    try? await Task.sleep(for: ChatCheckAgainHold.limit - ChatCheckAgainHold.minimum)
-                    guard !Task.isCancelled, hold != nil else { return }
-                    withAnimation(ChatCheckAgainHold.animation) { hold = nil }
-                }
-                .onChange(of: chat?.isRetrying ?? false) { endIfAnswered() }
-        }
-
-        private func endIfAnswered() {
-            guard let hold, hold.hasShownMinimum, !(chat?.isRetrying ?? false) else { return }
-            withAnimation(ChatCheckAgainHold.animation) { self.hold = nil }
+        @MainActor
+        static func wait(
+            minimum: Duration = Self.minimum,
+            limit: Duration = Self.limit,
+            poll: Duration = .milliseconds(50),
+            until isAnswered: @MainActor () -> Bool
+        ) async {
+            let deadline = ContinuousClock.now + limit
+            try? await Task.sleep(for: minimum)
+            while !Task.isCancelled, !isAnswered(), ContinuousClock.now < deadline {
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                try? await Task.sleep(for: min(poll, max(.zero, remaining)))
+            }
         }
     }
 
@@ -929,7 +968,8 @@ struct AgentChatSurfaceView: View {
                 return try await chat.readImage(at: path)
             },
             thumbnails: chat?.thumbnails,
-            collapseAvailabilityChanged: { canCollapseTrajectory = $0 })
+            collapseAvailabilityChanged: { canCollapseTrajectory = $0 },
+            previousMessageAvailabilityChanged: { canJumpToPreviousMessage = $0 })
     }
 
     /// What an expanded row whose output was never read says until it can
@@ -982,9 +1022,15 @@ struct AgentChatSurfaceView: View {
         let isSwitching = { isSwitchingSetting }
         let settle = settleUnansweredSwitch
         let session = session
+        let isClaude = program == .claude
         policy.preflight = { text in
             if isSwitching() {
-                return .inputNotReady(String(localized: "Claude Code is switching a setting. Try again in a moment."))
+                return .inputNotReady(
+                    isClaude
+                        ? String(localized: "Claude Code is switching a setting. Try again in a moment.")
+                        : String(
+                            localized: "The Agent is switching a setting. Try again in a moment.",
+                            comment: "Chat status when input is refused because the Agent is switching a setting."))
             }
             // Stop's follow-through types there too (agy's `/tasks`).
             if let hold = session.heldSend() { return hold }
@@ -1092,21 +1138,38 @@ struct AgentChatSurfaceView: View {
             interrupt: stopInterrupt)
         .frame(maxWidth: ChatTimelineMetrics.maximumContentWidth)
         .frame(maxWidth: .infinity)
-        // The transcript records the mode as snapshots, and not every change
-        // (plan approval moves to auto unrecorded); the footer shows it live.
-        .task(id: "\(agent.agent.status)-\(chat?.conversationGeneration ?? 0)-\(console.hostConnectionGenerations[agent.hostID] ?? 0)-\(console.isHostReadyForInput(agent.hostID))") {
-            await readSessionSettingsFromScreen()
+    }
+
+    private func loadAgyModels() async {
+        guard program == .agy, console.isHostReadyForInput(agent.hostID) else { return }
+        if let models = try? await console.fetchAgyModels(on: agent.hostID), !models.isEmpty {
+            agyModels = models
         }
     }
 
     /// One confirmed snapshot for the title's model and the Composer's mode.
     private var sessionSettings: AgentSessionSettings? {
-        (chat?.conversation.transcript).map {
-            AgentSessionSettings(
-                model: override(.model) ?? $0.model ?? welcomeModel,
-                permissionMode: override(.permissionMode) ?? $0.permissionMode,
-                effort: override(.effort) ?? $0.effort)
+        guard chat != nil else { return nil }
+        var model = override(.model) ?? chat?.conversation.transcript.model ?? welcomeModel
+        if program == .agy, let raw = model,
+            let choice = agyModels.first(where: { $0.id.caseInsensitiveCompare(raw) == .orderedSame })
+        {
+            model = choice.title
+        } else if program == .codex, let raw = model {
+            model = codexModelCatalog.displayTitle(for: raw)
         }
+        let permissionMode = override(.permissionMode) ?? chat?.conversation.transcript.permissionMode
+        let effort: String?
+        if let overridden = override(.effort) {
+            effort = overridden.isEmpty ? nil : overridden
+        } else if let recorded = chat?.conversation.transcript.effort {
+            effort = recorded
+        } else if override(.model) == nil, chat?.conversation.transcript.model == nil {
+            effort = welcomeEffort
+        } else {
+            effort = nil
+        }
+        return AgentSessionSettings(model: model, permissionMode: permissionMode, effort: effort)
     }
 
     private func override(_ setting: AgentSettingOverrides.Setting) -> String? {
@@ -1123,29 +1186,106 @@ struct AgentChatSurfaceView: View {
         return [transcript?.permissionMode, transcript?.model, transcript?.effort]
     }
 
-    /// Claude Code's permission mode and model, switched from the status line.
+    /// Session settings switched from Chat's header or status line.
     private var sessionControls: AgentSessionControls? {
-        guard program == .claude else { return nil }
         let status = agent.agent.status
-        return AgentSessionControls(
-            isEnabled: (status == .idle || status == .done) && !isSwitchingSetting && !isComposerSending,
-            isSwitchingPermissionMode: switchingSetting == .permissionMode,
-            allowsBypassPermissions: session.settingOverrides.allowsBypassPermissions,
-            setPermissionMode: { target in switchSetting(.permissionMode) { await switchPermissionMode(to: target) } },
-            setModel: { id in
-                switchSetting(.model) {
-                    if let model = await typeCommand("/model \(id)", done: "Set model to", kept: "Kept model as") {
-                        setOverride(.model, model)
+        let isEnabled = (status == .idle || status == .done)
+            && !isSwitchingSetting && !isComposerSending && !session.agentKeys.isRunningQueuedWork
+        switch program {
+        case .claude:
+            return AgentSessionControls(
+                isEnabled: isEnabled,
+                isSwitchingPermissionMode: switchingSetting == .permissionMode,
+                allowsBypassPermissions: session.settingOverrides.allowsBypassPermissions,
+                setPermissionMode: { target in switchSetting(.permissionMode) { await switchPermissionMode(to: target) } },
+                setModel: { id in
+                    switchSetting(.model) {
+                        if let model = await typeCommand("/model \(id)", done: "Set model to", kept: "Kept model as") {
+                            setOverride(.model, model)
+                        }
                     }
-                }
-            },
-            setEffort: { level in
-                switchSetting(.effort) {
-                    if await typeCommand("/effort \(level)", done: "Set effort level to", kept: "Kept effort level as") != nil {
-                        setOverride(.effort, level)
+                },
+                setEffort: { level in
+                    switchSetting(.effort) {
+                        if await typeCommand("/effort \(level)", done: "Set effort level to", kept: "Kept effort level as") != nil {
+                            setOverride(.effort, level)
+                        }
                     }
-                }
-            })
+                })
+        case .agy:
+            let choices = agyModels.isEmpty ? AgyModelCatalog.defaultChoices : agyModels
+            guard !choices.isEmpty else { return nil }
+            let current = sessionSettings
+            let matched = choices.first { $0.matches(model: current?.model) }
+            let efforts: [String]
+            if let matched {
+                efforts = matched.efforts
+            } else if let effort = current?.effort, !effort.isEmpty {
+                efforts = AgyModelCatalog.effortOrder
+            } else {
+                efforts = []
+            }
+            return AgentSessionControls(
+                isEnabled: isEnabled,
+                modelChoices: choices.map { (id: $0.id, title: $0.title) },
+                effortChoices: efforts,
+                modelMatches: { model, choiceID in
+                    choices.first(where: { $0.id == choiceID })?.matches(model: model) == true
+                },
+                setPermissionMode: nil,
+                setModel: { id in
+                    let preferredEffort = sessionSettings?.effort
+                    let slug = choices.first(where: { $0.id == id })?.slug(preferringEffort: preferredEffort) ?? id
+                    switchSetting(.model) {
+                        if let confirmed = await typeAgyCommand("/model \(slug)", kind: .model) {
+                            let resolved = AgyModelCatalog.resolveDisplayLabel(confirmed.label, in: choices)
+                            setOverride(.model, confirmed.footer?.model ?? resolved.model)
+                            setOverride(.effort, (confirmed.footer != nil ? confirmed.footer?.effort : resolved.effort) ?? "")
+                        }
+                    }
+                },
+                setEffort: { level in
+                    switchSetting(.effort) {
+                        if let confirmed = await typeAgyCommand("/effort \(level)", kind: .effort) {
+                            if let footer = confirmed.footer {
+                                setOverride(.model, footer.model)
+                                setOverride(.effort, footer.effort ?? "")
+                            } else {
+                                setOverride(.effort, confirmed.label.lowercased())
+                            }
+                        }
+                    }
+                })
+        case .codex:
+            let catalog = codexModelCatalog
+            let activeModel = sessionSettings?.model
+            return AgentSessionControls(
+                isEnabled: isEnabled,
+                modelChoices: catalog.choices.map { (id: $0.id, title: $0.title) },
+                effortChoices: catalog.effortChoices(for: activeModel),
+                modelMatches: { model, choiceID in
+                    catalog.selectedChoiceID(for: model) == choiceID
+                },
+                setPermissionMode: nil,
+                setModel: { id in
+                    switchSetting(.model) {
+                        if let confirmed = await typeCodexSettingCommand("/model \(id)") {
+                            setOverride(.model, confirmed.model)
+                            setOverride(.effort, confirmed.effort ?? "")
+                        }
+                    }
+                },
+                setEffort: { level in
+                    switchSetting(.effort) {
+                        if let confirmed = await typeCodexSettingCommand("/model --reasoning=\(level)") {
+                            setOverride(.model, confirmed.model)
+                            setOverride(.effort, confirmed.effort ?? "")
+                        }
+                    }
+                })
+        default:
+            return nil
+        }
     }
 
     /// A Composer Send between its first check and its last key, which a
@@ -1159,7 +1299,9 @@ struct AgentChatSurfaceView: View {
         _ setting: AgentSettingOverrides.Setting, _ work: @escaping @MainActor () async -> Void
     ) {
         // A confirmation may close after a turn began; the menu's state is older.
-        guard !isSwitchingSetting, !isComposerSending, agentActivity() == .idle else { return }
+        guard !isSwitchingSetting, !isComposerSending, !session.agentKeys.isRunningQueuedWork,
+            agentActivity() == .idle
+        else { return }
         switchingSetting = setting
         let settle = settleUnansweredSwitch
         Task {
@@ -1208,29 +1350,78 @@ struct AgentChatSurfaceView: View {
     /// process can report Idle before painting; retry missing frames without keys.
     private func readSessionSettingsFromScreen() async {
         let status = agent.agent.status
-        guard program == .claude, !isSwitchingSetting else { return }
-        session.settingOverrides.refreshPermissionLaunch(nil, liveMode: nil)
-        guard status == .idle || status == .done, console.isHostReadyForInput(agent.hostID) else { return }
-        var mode: String?
-        for attempt in 0..<10 {
-            let screen = try? await readAgentScreen()
-            guard !Task.isCancelled, !isSwitchingSetting, isOnStage() else { return }
-            if let screen {
-                mode = AgentSessionSettings.permissionMode(onScreen: screen)
-                welcomeModel = AgentSessionSettings.welcomeModel(onScreen: screen)
-                if let mode {
-                    setOverride(.permissionMode, mode)
-                    session.settingOverrides.refreshPermissionLaunch(nil, liveMode: mode)
-                    break
+        guard !isSwitchingSetting else { return }
+        switch program {
+        case .claude:
+            session.settingOverrides.refreshPermissionLaunch(nil, liveMode: nil)
+            guard status == .idle || status == .done, console.isHostReadyForInput(agent.hostID) else { return }
+            var mode: String?
+            for attempt in 0..<10 {
+                let screen = try? await readAgentScreen()
+                guard !Task.isCancelled, !isSwitchingSetting, isOnStage() else { return }
+                if let screen {
+                    mode = AgentSessionSettings.permissionMode(onScreen: screen)
+                    welcomeModel = AgentSessionSettings.welcomeModel(onScreen: screen)
+                    if let mode {
+                        setOverride(.permissionMode, mode)
+                        session.settingOverrides.refreshPermissionLaunch(nil, liveMode: mode)
+                        break
+                    }
+                }
+                if attempt < 9 {
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
                 }
             }
-            if attempt < 9 {
-                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            let launch = try? await console.claudePermissionLaunch(for: agent, corePin: session.corePin)
+            guard !Task.isCancelled, !isSwitchingSetting else { return }
+            session.settingOverrides.refreshPermissionLaunch(launch, liveMode: mode)
+        case .agy:
+            guard console.isHostReadyForInput(agent.hostID) else { return }
+            let attempts = (status == .idle || status == .done) ? 10 : 1
+            for attempt in 0..<attempts {
+                let screen = try? await readAgentScreen()
+                guard !Task.isCancelled, !isSwitchingSetting, isOnStage() else { return }
+                if let screen {
+                    let agy = AgyScreen(screen)
+                    if let welcome = agy.welcomeModel {
+                        welcomeModel = welcome.model
+                        welcomeEffort = welcome.effort
+                    }
+                    if let footer = agy.footerModel {
+                        setOverride(.model, footer.model)
+                        setOverride(.effort, footer.effort ?? "")
+                        break
+                    }
+                    if agy.welcomeModel != nil {
+                        break
+                    }
+                }
+                if attempt < attempts - 1 {
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                }
             }
+        case .codex:
+            guard status == .idle || status == .done,
+                console.isHostReadyForInput(agent.hostID),
+                chat?.conversation.transcript.model == nil
+            else { return }
+            for attempt in 0..<10 {
+                let screen = try? await readAgentScreen()
+                guard !Task.isCancelled, !isSwitchingSetting, isOnStage(),
+                    chat?.conversation.transcript.model == nil
+                else { return }
+                if let screen, let footer = CodexSessionScreen.footerSettings(onScreen: screen) {
+                    welcomeModel = footer.model
+                    welcomeEffort = footer.effort
+                    break
+                }
+                if attempt < 9 {
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                }
+            }
+        default:
+            return
         }
-        let launch = try? await console.claudePermissionLaunch(for: agent, corePin: session.corePin)
-        guard !Task.isCancelled, !isSwitchingSetting else { return }
-        session.settingOverrides.refreshPermissionLaunch(launch, liveMode: mode)
     }
 
     /// Rechecks launch opt-in after confirmation, then lets the footer confirm
@@ -1345,6 +1536,138 @@ struct AgentChatSurfaceView: View {
         return nil
     }
 
+    /// Types an Antigravity CLI `/model <slug>` or `/effort <level>` command
+    /// into an empty idle input box. The trailing space dismisses agy's `/`
+    /// autocomplete popup so Enter executes the typed command rather than the
+    /// popup's selection; confirmation is read from the `> /model` or
+    /// `> /effort` block above the input box plus the updated live footer.
+    private func typeAgyCommand(
+        _ command: String, kind: AgyScreen.SettingCommand
+    ) async -> (label: String, footer: AgyScreen.FooterModel?)? {
+        if let reason = await confirmSession?() {
+            permissionErrorMessage = reason
+            return nil
+        }
+        guard let chat, !session.agentKeys.isRunningQueuedWork else { return nil }
+        let io = chat.screenIO
+        let generation = chat.conversationGeneration
+        let activity = agentActivity
+        do {
+            let before = try await io.readScreen()
+            guard PreSendGate.check(before, program: .agy, activity: activity()) == .send else {
+                throw CancellationError()
+            }
+            let was = AgyScreen.CommandOutcome(of: kind, on: before)
+            guard isOnStage(), chat.conversationGeneration == generation,
+                !session.agentKeys.isRunningQueuedWork, activity() == .idle
+            else { throw CancellationError() }
+            try await typeSwitchStep(io, .paste(command + " "), whileShowing: {
+                PreSendGate.check($0, program: .agy, activity: .idle) == .send
+            })
+            try await Task.sleep(for: .milliseconds(150))
+            guard isOnStage(), chat.conversationGeneration == generation,
+                !session.agentKeys.isRunningQueuedWork, activity() == .idle
+            else { throw CancellationError() }
+            try await typeSwitchStep(io, .keys(["enter"]), whileShowing: { screen in
+                guard case .text(let typed) = InputBoxStateDetector.detect(screen, program: .agy) else {
+                    return false
+                }
+                return typed.trimmingCharacters(in: .whitespacesAndNewlines) == command
+            })
+            for _ in 0..<12 {
+                try await Task.sleep(for: .milliseconds(250))
+                let screen = try await io.readScreen()
+                guard isOnStage(), chat.conversationGeneration == generation else { throw CancellationError() }
+                let outcome = AgyScreen.CommandOutcome(of: kind, on: screen)
+                if let answered = outcome.answered(since: was) {
+                    if answered, let label = outcome.value {
+                        return (label, AgyScreen(screen).footerModel)
+                    }
+                    break
+                }
+            }
+        } catch {}
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
+        return nil
+    }
+
+    private func typeCodexSettingCommand(_ command: String) async -> (model: String, effort: String?)? {
+        if let reason = await confirmSession?() {
+            permissionErrorMessage = reason
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            return nil
+        }
+        guard let chat, !session.agentKeys.isRunningQueuedWork else { return nil }
+        let io = chat.screenIO
+        let generation = chat.conversationGeneration
+        let activity = agentActivity
+        do {
+            let before = try await io.readScreen()
+            guard PreSendGate.check(before, program: .codex, activity: activity()) == .send else {
+                throw CancellationError()
+            }
+            guard isOnStage(), chat.conversationGeneration == generation,
+                !session.agentKeys.isRunningQueuedWork, activity() == .idle
+            else {
+                throw CancellationError()
+            }
+            try await typeSwitchStep(
+                io, .paste(command),
+                whileShowing: { PreSendGate.check($0, program: .codex, activity: .idle) == .send })
+            let checkTyped: @Sendable (ANSIScreen) -> Bool = { screen in
+                guard case .text(let typed) = InputBoxStateDetector.detect(screen, program: .codex) else {
+                    return false
+                }
+                return typed.trimmingCharacters(in: .whitespacesAndNewlines) == command
+            }
+            if io.typeWhileShowing == nil {
+                var readyForEnter = false
+                for _ in 0..<6 {
+                    try await Task.sleep(for: .milliseconds(150))
+                    let afterPaste = try await io.readScreen()
+                    guard isOnStage(), chat.conversationGeneration == generation,
+                        !session.agentKeys.isRunningQueuedWork, activity() == .idle
+                    else {
+                        throw CancellationError()
+                    }
+                    if checkTyped(afterPaste) {
+                        readyForEnter = true
+                        break
+                    }
+                    guard case .empty = InputBoxStateDetector.detect(afterPaste, program: .codex) else {
+                        throw CancellationError()
+                    }
+                }
+                guard readyForEnter else { throw CancellationError() }
+            } else {
+                try await Task.sleep(for: .milliseconds(150))
+                guard isOnStage(), chat.conversationGeneration == generation,
+                    !session.agentKeys.isRunningQueuedWork, activity() == .idle
+                else {
+                    throw CancellationError()
+                }
+            }
+            try await typeSwitchStep(io, .keys(["enter"]), whileShowing: checkTyped)
+            for _ in 0..<12 {
+                try await Task.sleep(for: .milliseconds(250))
+                let screen = try await io.readScreen()
+                guard isOnStage(), chat.conversationGeneration == generation else { throw CancellationError() }
+                switch CodexSessionScreen.switchOutcome(since: before, command: command, on: screen) {
+                case .changed(let model, let effort):
+                    return (model: model, effort: effort)
+                case .failed(let message):
+                    permissionErrorMessage = message
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                    return nil
+                case nil:
+                    break
+                }
+            }
+        } catch {}
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
+        return nil
+    }
+
     private var switchQuestionShown: Binding<Bool> {
         Binding(get: { switchQuestion != nil }, set: { if !$0 { answerSwitch(false) } })
     }
@@ -1358,7 +1681,8 @@ struct AgentChatSurfaceView: View {
     /// Chat's Stop: the program's Stop plan, in line with the Agent page's
     /// keys, as typed keys would arrive.
     private var stopInterrupt: AgentComposerInterrupt {
-        console.chatStopPlan(for: agent, program: program).composerInterrupt(
+        console.chatInterrupt(
+            for: agent, program: program, keepingTo: session.corePin,
             context: stopContext, agentKeys: session.agentKeys, followThrough: stopFollowThrough)
     }
 
@@ -1462,9 +1786,10 @@ struct AgentChatSurfaceView: View {
         return AgentComposerActions(
             canBegin: session.staging.canBegin,
             attachLinkCount: 0,
-            addImage: { isSelectingPhoto = true },
-            pasteImage: { _ = session.staging.begin(.photo(ClipboardImageSelection.current())) },
-            addFile: { isSelectingFile = true },
+            addImage: capabilities.uploads ? { isSelectingPhoto = true } : nil,
+            pasteImage: capabilities.uploads
+                ? { _ = session.staging.begin(.photo(ClipboardImageSelection.current())) } : nil,
+            addFile: capabilities.uploads ? { isSelectingFile = true } : nil,
             showAttachLinks: {},
             openTerminal: canOpenTerminal
                 ? {
@@ -1549,6 +1874,7 @@ struct AgentChatSurfaceView: View {
 
     /// The terminal takes over in place with the keyboard as Chat leaves it.
     private func showAgentTerminal() {
+        cancelCheckAgain()
         if keyboardIsUp { keyboardHandoff.arm(for: agent.id, mode: .text) }
         selectSurface(.terminal)
     }
