@@ -53,6 +53,7 @@ struct AgentChatSurfaceView: View {
     @State private var previousMessageRequest = 0
     @State private var nextMessageRequest = 0
     @State private var topJumpRequest = 0
+    @State private var isHoldingTopJump = false
     @State private var canJumpToPreviousMessage = false
     @State private var followRequest = 0
     @State private var collapseRequest = 0
@@ -366,6 +367,7 @@ struct AgentChatSurfaceView: View {
             // says whether Chat really left.
             stageExit?.cancel()
             stageExit = ChatStageExit.watch(isOnStage: isOnStage) { [chat, viewerID, composer] in
+                isHoldingTopJump = false
                 chat?.hide(viewerID)
                 composer.voice.composerDidLeaveScreen()
                 answerSwitch(false)
@@ -389,7 +391,7 @@ struct AgentChatSurfaceView: View {
             let earlier = Set(previous.map(\.id))
             if messages.contains(where: { !earlier.contains($0.id) }) { followRequest += 1 }
         }
-        .onChange(of: composer.draft) { _, draft in
+        .onChange(of: composer.composedDraft) { _, draft in
             chat?.draftDidChange(to: draft)
         }
         // Also on appearing: Chat may have followed another while it was away.
@@ -415,8 +417,7 @@ struct AgentChatSurfaceView: View {
         .onChange(of: selectedPhotos) { _, items in
             guard !items.isEmpty else { return }
             selectedPhotos = []
-            let staging = session.staging
-            Task { await staging.beginAll(items.map { .photo(PhotosPickerImageSelection(item: $0)) }) }
+            composer.enqueueImages(items.map { PhotosPickerImageSelection(item: $0) })
         }
         .onChange(of: composer.draft.hasPrefix("/"), initial: true) { _, opensMenu in
             guard opensMenu, let skills else { return }
@@ -588,10 +589,12 @@ struct AgentChatSurfaceView: View {
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { collapseControlHeight = $0 }
             ChatMessageJumpControl(
-                showsPrevious: presentation == .timeline && timeline.state.isReady && canJumpToPreviousMessage,
+                showsPrevious: presentation == .timeline && timeline.state.isReady
+                    && (canJumpToPreviousMessage || isHoldingTopJump),
                 showsLatest: presentation == .timeline && timeline.state.isReady && !isFollowing,
                 jumpPrevious: { previousMessageRequest += 1 },
                 jumpTop: { topJumpRequest += 1 },
+                jumpTopHoldingChanged: { isHoldingTopJump = $0 },
                 jumpNext: { nextMessageRequest += 1 },
                 jumpLatest: { jumpRequest += 1 })
         }
@@ -627,6 +630,7 @@ struct AgentChatSurfaceView: View {
                 previousMessageRequest: previousMessageRequest,
                 nextMessageRequest: nextMessageRequest,
                 topJumpRequest: topJumpRequest,
+                isHoldingTopJump: isHoldingTopJump,
                 followRequest: followRequest,
                 collapseRequest: collapseRequest,
                 topObstruction: topInset + headerObstruction + bannerHeight,
@@ -943,8 +947,11 @@ struct AgentChatSurfaceView: View {
         var isReady = !conversation.transcript.entries.isEmpty || !pending.isEmpty
         if case .locating = conversation.phase {} else { isReady = true }
         // Work that has shown no sign of itself for hours keeps no turn open.
+        // Use the Host's underlying foreground activity so a completed or
+        // earlier interrupted turn does not sprout a foreground Working timer
+        // while Antigravity CLI's Background Work promotes the Console row.
         let signals = ChatTurnSignals(
-            activity: ChatAgentActivity(agent.agent.status),
+            activity: ChatAgentActivity(chat.agent.status),
             isBackgroundWorkRunning: chat.backgroundWork.rows.contains { $0.isRunning && !$0.isStale },
             foldsFinishedTurns: foldsFinishedTurns,
             isLive: ChatTurnSignals.isLive(hostStatus: console.hostStatuses[agent.hostID], conversation: conversation),
@@ -958,6 +965,7 @@ struct AgentChatSurfaceView: View {
     private var timelineActions: ChatTimelineActions {
         ChatTimelineActions(
             loadOlder: { chat?.loadOlder() },
+            canLoadOlder: { chat?.canLoadOlder ?? false },
             loadOlderAutomatically: { chat?.loadOlder(automatic: true) },
             followingChanged: { isFollowing = $0 },
             firstPositionedLayout: { detailCrossfade?.contentDidAppear() },
@@ -1687,16 +1695,26 @@ struct AgentChatSurfaceView: View {
     }
 
     /// Antigravity CLI's Stop also ends the commands the turn sent to the
-    /// background, which its Esc leaves running (ADR 0024).
+    /// background, which its Esc leaves running (ADR 0024). When only
+    /// Background Work keeps the Agent Working after its foreground turn
+    /// already finished, there is no open foreground turn to place.
     private var stopFollowThrough: (@MainActor () -> ChatStopFollowThrough?)? {
         guard program == .agy, let chat else { return nil }
         let composer = composer
         return {
-            AgyBackgroundTaskStop.followThrough(
-                reading: AgyBackgroundTaskStop.Transcript(chat: chat) {
-                    ChatComposerEchoes.awaitsRecord(composer.messages, statuses: chat.sendStatuses)
-                },
-                io: chat.screenIO, mayContinue: { !composer.messages.contains { $0.state == .sending } })
+            guard chat.agent.status == .working else { return nil }
+            guard
+                let followThrough = AgyBackgroundTaskStop.followThrough(
+                    reading: AgyBackgroundTaskStop.Transcript(chat: chat) {
+                        ChatComposerEchoes.awaitsRecord(composer.messages, statuses: chat.sendStatuses)
+                    },
+                    io: chat.screenIO, mayContinue: { !composer.messages.contains { $0.state == .sending } })
+            else { return nil }
+            return {
+                let notice = await followThrough()
+                chat.noteAgyBackgroundWorkMayHaveChanged()
+                return notice
+            }
         }
     }
 
@@ -1788,7 +1806,7 @@ struct AgentChatSurfaceView: View {
             attachLinkCount: 0,
             addImage: capabilities.uploads ? { isSelectingPhoto = true } : nil,
             pasteImage: capabilities.uploads
-                ? { _ = session.staging.begin(.photo(ClipboardImageSelection.current())) } : nil,
+                ? { composer.enqueueImages([ClipboardImageSelection.current()]) } : nil,
             addFile: capabilities.uploads ? { isSelectingFile = true } : nil,
             showAttachLinks: {},
             openTerminal: canOpenTerminal

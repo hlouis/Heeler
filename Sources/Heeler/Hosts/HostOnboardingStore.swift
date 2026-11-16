@@ -46,6 +46,8 @@ struct HostOnboardingDependencies: Sendable {
     var coreKernel: @MainActor @Sendable (Host.ID) -> String? = { _ in nil }
     /// A tmux Host's checks resolved its paths again, for the catalog to keep.
     var noteTmuxPaths: @MainActor @Sendable (Host.ID, TmuxPaths) -> Void = { _, _ in }
+    /// A Server's page read its plugin, or changed it, for Updates to follow.
+    var notePlugin: @MainActor @Sendable (Host.ID, HeelerPluginStatus) -> Void = { _, _ in }
 }
 
 /// Drives one Host's onboarding preflight (#14): resolve credentials,
@@ -53,9 +55,9 @@ struct HostOnboardingDependencies: Sendable {
 /// ping the selected session, and render the outcome as the checklist. A
 /// Host with a herdr endpoint (ADR 0023) skips discovery, because its socket
 /// already fixes the session, and must instead prove its launcher answers. A
-/// Host added unconfirmed first detects which servers it runs and has the user
-/// confirm one kind, then runs that kind's checks (ADR 0031). A tmux Host's
-/// checks ask its server and start none (ADR 0044).
+/// tmux Host's checks ask its server and start none (ADR 0044). The record is
+/// one Server that is on: a Host's Servers are found and turned on from Host
+/// detail (ADR 0047), and a record with none has no checks to run.
 @MainActor
 @Observable
 final class HostOnboardingStore {
@@ -91,15 +93,6 @@ final class HostOnboardingStore {
     /// Set when the last run stopped at an Overlay Network that needs an
     /// interactive sign-in; the UI offers to open it.
     private(set) var overlayLoginURL: URL?
-    /// What an unconfirmed Host's one detection exec found.
-    private(set) var detection: ServerKindDetection?
-    /// Why a reached Host could not be read, which leaves its kind to the user.
-    private(set) var detectionFailure: String?
-    /// Why the last confirmation was refused, for the user to read.
-    private(set) var confirmationRefusal: String?
-    /// The socket a tmux confirmation names: one detection offered, or the typed
-    /// name when no server answers.
-    private(set) var tmuxSocket = TmuxSocketName.defaultName
     /// What a tmux Host's server answered on the last checks.
     private(set) var tmuxStatus: TmuxServerStatus?
     /// What the locator found on a core Host the last checks read as not running.
@@ -130,8 +123,8 @@ final class HostOnboardingStore {
     /// Identifies the run whose trust prompts may still be shown.
     @ObservationIgnored private var currentRun = UUID()
     @ObservationIgnored private let hostHelperDidChange: @MainActor () -> Void
-    @ObservationIgnored private let noteWindowsCore: @MainActor (Host.ID) -> Void
     @ObservationIgnored private let noteTmuxPaths: @MainActor (Host.ID, TmuxPaths) -> Void
+    @ObservationIgnored private let notePlugin: @MainActor (Host.ID, HeelerPluginStatus) -> Void
     @ObservationIgnored private let hostHelperHealthGap: @Sendable () async throws -> Void
     @ObservationIgnored private let harnessEdits: HarnessConfigEditStore?
     /// A Mac's second health read, which outlives the run that began it and owns
@@ -152,12 +145,11 @@ final class HostOnboardingStore {
             try await Task.sleep(for: HostHelperLaunchAgent.healthGap)
         },
         harnessEdits: HarnessConfigEditStore? = nil,
-        noteWindowsCore: @escaping @MainActor (Host.ID) -> Void = { _ in },
-        noteTmuxPaths: @escaping @MainActor (Host.ID, TmuxPaths) -> Void = { _, _ in }
+        noteTmuxPaths: @escaping @MainActor (Host.ID, TmuxPaths) -> Void = { _, _ in },
+        notePlugin: @escaping @MainActor (Host.ID, HeelerPluginStatus) -> Void = { _, _ in }
     ) {
-        self.noteWindowsCore = noteWindowsCore
         self.noteTmuxPaths = noteTmuxPaths
-        tmuxSocket = TmuxSocketName.normalized(host.sessionName)
+        self.notePlugin = notePlugin
         self.hostHelperHealthGap = hostHelperHealthGap
         self.harnessEdits = harnessEdits
         self.coreHolderRestart = coreHolderRestart
@@ -187,11 +179,7 @@ final class HostOnboardingStore {
         pluginStatus = .checking
         pendingHostKeyReplacement = nil
         overlayLoginURL = nil
-        detection = nil
-        detectionFailure = nil
-        confirmationRefusal = nil
         tmuxStatus = nil
-        tmuxSocket = TmuxSocketName.normalized(host.sessionName)
         notRunningCore = nil
         coreStartConfirmation = nil
         coreStart = .idle
@@ -284,7 +272,7 @@ final class HostOnboardingStore {
             host: host, credentials: resolved, hostKeyPolicy: policy, overlays: overlays)
         switch host.serverKind {
         case .unconfirmed:
-            await performDetection(settings: settings)
+            // No Server, so nothing to check: Host detail looks for them.
             return
         case .herdrCore:
             await performCoreChecks(settings: settings, coreReportedRunning: coreReportedRunning)
@@ -331,7 +319,10 @@ final class HostOnboardingStore {
                         // run still waits for this read (bounded by the request
                         // timeout), and its failure never fails the preflight.
                         let plugin = await HeelerPluginStatus.read(over: transport)
-                        if !Task.isCancelled { pluginStatus = plugin }
+                        if !Task.isCancelled {
+                            pluginStatus = plugin
+                            notePlugin(host.id, plugin)
+                        }
                     }
                 } catch {
                     if !Task.isCancelled {
@@ -492,126 +483,10 @@ final class HostOnboardingStore {
         return store
     }
 
-    /// One exec over a connection of its own, which starts no server. A Host
-    /// out of reach reads as the preflight's connection failure.
-    private func performDetection(settings: SSHTransportSettings) async {
-        do {
-            let connection = try await connector.connectForDetection(settings: settings)
-            guard !Task.isCancelled else {
-                try? await connection.close()
-                return
-            }
-            do {
-                let found = try await ServerKindDetection.run(over: connection, session: host.sessionName)
-                if !Task.isCancelled {
-                    detection = found
-                    tmuxSocket = found.preselectedTmuxSocket(typed: host.sessionName)
-                }
-            } catch {
-                if !Task.isCancelled {
-                    detectionFailure = (error as? TransportError)?.presentation.message ?? "\(error)"
-                }
-            }
-            try? await connection.close()
-        } catch {
-            guard !Task.isCancelled else { return }
-            captureHostKeyReplacement(error)
-            report = failureReport(error)
-        }
-    }
-
-    /// The kinds the user may confirm: none until the Host has been reached.
-    var offeredKinds: [ServerKind] {
-        guard host.serverKind == .unconfirmed else { return [] }
-        if let detection { return detection.offeredKinds }
-        return detectionFailure == nil ? [] : ServerKindDetection.offeredWithoutFindings
-    }
-
     /// A tmux Host's checks found its tmux and no server on its socket.
     var isWaitingForTmuxServer: Bool {
         guard host.serverKind == .tmux, case .failed? = report?[.serverRunning] else { return false }
         return true
-    }
-
-    /// The sockets a tmux server answers on, for the confirmation to choose from.
-    var tmuxSocketChoices: [String] {
-        host.serverKind == .unconfirmed ? detection?.tmuxSockets ?? [] : []
-    }
-
-    /// Chooses the socket a tmux confirmation names, among those offered.
-    func selectTmuxSocket(_ name: String) {
-        guard tmuxSocketChoices.contains(name) else { return }
-        tmuxSocket = name
-    }
-
-    /// What the confirmation adds to the findings it lists, if anything.
-    var confirmationNote: String? {
-        if let detectionFailure {
-            return String(localized: "Heeler could not read what this Host runs, so the choice is yours. \(detectionFailure)")
-        }
-        guard let detection else { return nil }
-        if case .sessionRefused(let reason) = detection.herdrCore {
-            return reason
-        }
-        switch detection.foundKinds.count {
-        case 0:
-            return detection.supportedKinds.count > 2
-                ? String(localized: "None of them was found. Choose the one you will use, and its checks say how to set it up.")
-                : String(localized: "Neither was found. Choose the one you will use, and its checks say how to set it up.")
-        case 1:
-            return nil
-        case 2:
-            return String(localized: "This machine runs both. A Host is one kind: confirm one here, then add the machine again for the other.")
-        default:
-            return String(localized: "This machine runs more than one. A Host is one kind: confirm one here, then add the machine again for each of the others.")
-        }
-    }
-
-    /// Confirms the Host's kind, once, then runs that kind's checks. A name refused
-    /// for that kind, by its server or by what this Host's platform can carry, leaves
-    /// the Host as it was and says why.
-    func confirmServerKind(_ kind: ServerKind, in catalog: HostStore) async {
-        guard phase != .running, offeredKinds.contains(kind) else { return }
-        if kind == .herdrCore, case .sessionRefused(let reason) = detection?.herdrCore {
-            confirmationRefusal = reason
-            return
-        }
-        if kind == .herdrCore, case .socketPathTooLong(_, let path, let limit) = detection?.herdrCore {
-            confirmationRefusal =
-                TransportError.herdrCoreSocketPathTooLong(path: path, limit: limit).presentation.message
-            return
-        }
-        if kind == .herdrCore, detection?.isNativeWindows == true { noteWindowsCore(host.id) }
-        do {
-            // A tmux Host takes the socket chosen here, and the paths this
-            // detection's login shell resolved for it (ADR 0044).
-            host =
-                kind == .tmux
-                ? try catalog.confirmServerKind(
-                    kind, for: host.id, sessionName: tmuxSocket,
-                    tmuxPaths: detection?.tmuxPaths(socketName: tmuxSocket))
-                : try catalog.confirmServerKind(kind, for: host.id)
-        } catch HostStoreError.sessionNameRefused(let reason) {
-            confirmationRefusal = reason
-            return
-        } catch HostStoreError.catalogUnreadable where kind == .tmux && catalog.tmuxCatalogLoadError != nil {
-            confirmationRefusal =
-                String(localized: "The saved tmux Hosts could not be read, so no tmux Host can be added.")
-            return
-        } catch HostStoreError.catalogUnreadable where catalog.coreCatalogLoadError != nil {
-            confirmationRefusal =
-                String(localized: "The saved herdr-core Hosts could not be read, so no herdr-core Host can be added.")
-            return
-        } catch {
-            confirmationRefusal = String(
-                localized: "The Server Kind could not be saved. (\(String(describing: error)))")
-            return
-        }
-        await runChecks()
-    }
-
-    func dismissConfirmationRefusal() {
-        confirmationRefusal = nil
     }
 
     /// What this Host offers once its checks read not running: Start on Linux,
@@ -744,142 +619,21 @@ final class HostOnboardingStore {
         pluginAction = failure.map(PluginActionState.failed) ?? .idle
     }
 
-    /// The action over a connection of its own, like the preflight's: the
-    /// Console's redials after a timeout and would run a step twice.
+    /// The action over a connection of its own, which `HeelerPluginActionRunner`
+    /// dials. A plugin that could not be read back keeps the last status in
+    /// place, and so does a refusal, so the sheet keeps the action it explains.
     private func performPluginAction(
         _ action: HeelerPluginPresentation.Notice.Action
     ) async -> HeelerPluginActionFailure? {
-        let resolved: SSHCredentials
-        do {
-            resolved = try credentials.credentials(for: host)
-        } catch {
-            return HeelerPluginActionFailure(
-                message: String(localized: "Could not load this Host's credentials. (\(String(describing: error)))"))
-        }
-        // The preflight already settled the Host key, so a key that still
-        // needs trusting is declined rather than asked about mid-change.
-        let policy = HostKeyPolicy(knownHosts: knownHosts) { _ in false }
-        let settings = SSHTransportSettings(
-            host: host, credentials: resolved, hostKeyPolicy: policy, overlays: overlays)
-        let transport: any Transport
-        do {
-            transport = try await connector.connect(settings: settings)
-        } catch {
-            return HeelerPluginActionFailure(
-                message: String(localized: "Heeler could not connect to the Host, so nothing changed."),
-                detail: (error as? TransportError)?.presentation.message ?? "\(error)")
-        }
-        var steps = action.steps
-        var skippedInstall: HeelerPluginActionFailure?
-        if steps.contains(.install) {
-            switch await installClearance(over: transport) {
-            case .clear:
-                break
-            case .nothingNewer(let reason):
-                // The action's other steps still apply.
-                steps.removeAll { $0 == .install }
-                skippedInstall = reason
-            case .refused(let reason):
-                try? await transport.close()
-                return reason
-            }
-            if steps.isEmpty {
-                try? await transport.close()
-                return skippedInstall
-            }
-        }
-        var stepError: (any Error)?
-        for step in steps {
-            do {
-                try await transport.runHeelerPluginStep(step)
-            } catch {
-                stepError = error
-                break
-            }
-        }
-        // herdr's registry is the answer either way: a step that timed out
-        // may still have finished, and two devices may update at once.
-        let status = await HeelerPluginStatus.read(over: transport)
-        try? await transport.close()
-        switch status {
-        case .installed, .notInstalled:
+        let outcome = await HeelerPluginActionRunner(
+            host: host, connector: connector, knownHosts: knownHosts, credentials: credentials,
+            overlays: overlays
+        ).run(action)
+        if let status = outcome.readBack {
             pluginStatus = status
-        case .checking, .unsupportedPlatform, .unsupportedServerKind, .unavailable:
-            // An unreadable plugin keeps the last status in place. A step
-            // whose connection dropped may have finished all the same.
-            guard let stepError else {
-                return HeelerPluginActionFailure(
-                    message: String(localized: "The change finished, but the plugin could not be read back. Run the checks again."))
-            }
-            if let error = stepError as? TransportError, error != .timedOut {
-                return HeelerPluginActionFailure(
-                    message: String(localized: "The connection ended during the change, which may still finish on the Host. Run the checks again."),
-                    detail: error.presentation.message)
-            }
-            return HeelerPluginActionFailure(stepError)
+            notePlugin(host.id, status)
         }
-        guard pluginPresentation.notice != nil else { return nil }
-        if let stepError { return HeelerPluginActionFailure(stepError) }
-        if let skippedInstall { return skippedInstall }
-        let bundled = HeelerPluginCompatibility.bundled
-        if let version = pluginStatus.confirmedVersion, version < bundled {
-            return HeelerPluginActionFailure(
-                message: String(localized: "herdr installed plugin \(String(describing: version)), the newest published, but this app expects \(String(describing: bundled))."))
-        }
-        return HeelerPluginActionFailure(
-            message: String(localized: "The change finished, but the plugin still needs the attention described above."))
-    }
-
-    /// Whether an action's install may run. herdr installs whatever the
-    /// plugin branch holds, and an app built ahead of the branch, or a Host
-    /// installed from elsewhere, can have a newer plugin than that. The
-    /// branch only moves forward (ADR 0026), so the version read here is the
-    /// least herdr installs. The Host's plugin is reread rather than taken
-    /// from the checks, since another device may have changed it; a refusal
-    /// leaves the status alone, so the sheet keeps the action it explains.
-    private enum InstallClearance {
-        case clear
-        /// The Host's plugin is newer than the branch.
-        case nothingNewer(HeelerPluginActionFailure)
-        case refused(HeelerPluginActionFailure)
-    }
-
-    private func installClearance(over transport: any Transport) async -> InstallClearance {
-        let installed: PluginVersion
-        switch await HeelerPluginStatus.read(over: transport) {
-        case .notInstalled:
-            return .clear
-        case .installed(let installation):
-            guard !installation.isLegacyID, installation.isReplaceableByInstall,
-                let version = installation.parsedVersion
-            else {
-                return .refused(HeelerPluginActionFailure(
-                    message: String(localized: "The plugin on the Host changed since the checks, so nothing changed. Run the checks again.")))
-            }
-            installed = version
-        case .checking, .unsupportedPlatform, .unsupportedServerKind, .unavailable:
-            return .refused(HeelerPluginActionFailure(
-                message: String(localized: "Heeler could not read the Host's plugin before changing it, so nothing changed. Run the checks again.")))
-        }
-        let published: PluginVersion
-        do {
-            published = try await transport.readPluginBranchVersion()
-        } catch {
-            let detail =
-                switch error {
-                case let error as PluginBranchVersionError: error.output.isEmpty ? nil : error.output
-                case let error as TransportError: error.presentation.message
-                default: "\(error)"
-                }
-            return .refused(HeelerPluginActionFailure(
-                message: String(localized: "Heeler could not check which plugin version the Host would install, so nothing changed. Check that the Host can reach github.com."),
-                detail: detail))
-        }
-        guard published >= installed else {
-            return .nothingNewer(HeelerPluginActionFailure(
-                message: String(localized: "The Host has plugin \(String(describing: installed)), newer than the published \(String(describing: published)), so Heeler did not update it.")))
-        }
-        return .clear
+        return outcome.failure
     }
 
     /// The user's verdict on the pending fingerprint.
@@ -898,70 +652,28 @@ final class HostOnboardingStore {
 
     /// Replaces a mismatched pin only after the UI has obtained an explicit
     /// confirmation, then immediately proves the new pin by rerunning preflight.
-    func trustPresentedHostKey() async {
+    /// `siblings` are the Host's other records, which the same key answers
+    /// for (ADR 0047). A Jump Host's pin is kept by the endpoint dialled, once
+    /// for all.
+    func trustPresentedHostKey(sharedWith siblings: [Host.ID] = []) async {
         guard phase != .running, let replacement = pendingHostKeyReplacement else { return }
-        let key =
+        let keys =
             if let jumpHost = replacement.jumpHost {
-                HostKeyTrust.endpoint.storageKey(host: jumpHost.address, port: jumpHost.port)
+                [HostKeyTrust.endpoint.storageKey(host: jumpHost.address, port: jumpHost.port)]
             } else {
-                HostKeyTrust.hostKey(host.id)
+                ([host.id] + siblings).map { HostKeyTrust.hostKey($0) }
             }
-        await knownHosts.setFingerprint(replacement.presented, host: key.host, port: key.port)
+        for key in keys {
+            await knownHosts.setFingerprint(replacement.presented, host: key.host, port: key.port)
+        }
         pendingHostKeyReplacement = nil
         await runChecks()
     }
 
     private func captureHostKeyReplacement(_ error: any Error) {
-        switch error {
-        case let TransportError.hostKeyMismatch(known, presented):
-            pendingHostKeyReplacement = HostKeyReplacement(known: known, presented: presented)
-        case let TransportError.jumpHostFailed(.hostKeyMismatch(known, presented)):
-            // A single route fails with its own error, unwrapped.
-            guard let jumpHost = host.routes.first.flatMap(HostKeyReplacement.JumpHost.init)
-            else { return }
-            pendingHostKeyReplacement = HostKeyReplacement(
-                known: known, presented: presented, jumpHost: jumpHost)
-        case TransportError.noRouteReached(let failures):
-            // Every route reaches the same Host, so a changed key is offered
-            // only when the routes that saw one agree on it. A LAN address may
-            // be another machine elsewhere, so when any other route saw a
-            // changed key, only those routes are asked.
-            let mismatches = failures.compactMap {
-                failure -> (mayNameAnotherMachine: Bool, replacement: HostKeyReplacement)? in
-                guard case let .hostKeyMismatch(known, presented) = failure.error else {
-                    return nil
-                }
-                return (
-                    failure.mayNameAnotherMachine,
-                    HostKeyReplacement(known: known, presented: presented))
-            }
-            let sameMachine = mismatches.filter { !$0.mayNameAnotherMachine }
-            let candidates = (sameMachine.isEmpty ? mismatches : sameMachine).map(\.replacement)
-            // A Jump Host's key belongs to another machine: it is offered
-            // per Jump Host, and only when the Host's own key is not.
-            let jumpHostCandidates = failures.compactMap { failure -> HostKeyReplacement? in
-                guard case let .jumpHostFailed(.hostKeyMismatch(known, presented)) = failure.error,
-                    let route = host.routes.first(where: { $0.id == failure.routeID }),
-                    let jumpHost = HostKeyReplacement.JumpHost(route)
-                else { return nil }
-                return HostKeyReplacement(known: known, presented: presented, jumpHost: jumpHost)
-            }
-            pendingHostKeyReplacement =
-                Self.agreed(candidates)
-                ?? jumpHostCandidates.lazy.compactMap { candidate in
-                    Self.agreed(jumpHostCandidates.filter { $0.jumpHost == candidate.jumpHost })
-                }.first
-        default:
-            return
+        if let replacement = HostKeyReplacement.offered(by: error, for: host) {
+            pendingHostKeyReplacement = replacement
         }
-    }
-
-    /// The replacement every candidate agrees on, if any.
-    private static func agreed(_ candidates: [HostKeyReplacement]) -> HostKeyReplacement? {
-        guard let first = candidates.first, candidates.allSatisfy({ $0 == first }) else {
-            return nil
-        }
-        return first
     }
 
     /// Runs an endpoint Host's session list as its launcher probe, before
@@ -1035,5 +747,60 @@ final class HostOnboardingStore {
         fingerprintTimeoutTask = nil
         pendingFingerprint = nil
         decision.resume(returning: trusted)
+    }
+}
+
+extension HostKeyReplacement {
+    /// The pin a failed connection to `host` offers to replace, nil when the
+    /// failure is no changed key or the routes that saw one disagree.
+    static func offered(by error: any Error, for host: Host) -> HostKeyReplacement? {
+        switch error {
+        case let TransportError.hostKeyMismatch(known, presented):
+            return HostKeyReplacement(known: known, presented: presented)
+        case let TransportError.jumpHostFailed(.hostKeyMismatch(known, presented)):
+            // A single route fails with its own error, unwrapped.
+            guard let jumpHost = host.routes.first.flatMap(HostKeyReplacement.JumpHost.init)
+            else { return nil }
+            return HostKeyReplacement(known: known, presented: presented, jumpHost: jumpHost)
+        case TransportError.noRouteReached(let failures):
+            // Every route reaches the same Host, so a changed key is offered
+            // only when the routes that saw one agree on it. A LAN address may
+            // be another machine elsewhere, so when any other route saw a
+            // changed key, only those routes are asked.
+            let mismatches = failures.compactMap {
+                failure -> (mayNameAnotherMachine: Bool, replacement: HostKeyReplacement)? in
+                guard case let .hostKeyMismatch(known, presented) = failure.error else {
+                    return nil
+                }
+                return (
+                    failure.mayNameAnotherMachine,
+                    HostKeyReplacement(known: known, presented: presented))
+            }
+            let sameMachine = mismatches.filter { !$0.mayNameAnotherMachine }
+            let candidates = (sameMachine.isEmpty ? mismatches : sameMachine).map(\.replacement)
+            // A Jump Host's key belongs to another machine: it is offered
+            // per Jump Host, and only when the Host's own key is not.
+            let jumpHostCandidates = failures.compactMap { failure -> HostKeyReplacement? in
+                guard case let .jumpHostFailed(.hostKeyMismatch(known, presented)) = failure.error,
+                    let route = host.routes.first(where: { $0.id == failure.routeID }),
+                    let jumpHost = HostKeyReplacement.JumpHost(route)
+                else { return nil }
+                return HostKeyReplacement(known: known, presented: presented, jumpHost: jumpHost)
+            }
+            return agreed(candidates)
+                ?? jumpHostCandidates.lazy.compactMap { candidate in
+                    agreed(jumpHostCandidates.filter { $0.jumpHost == candidate.jumpHost })
+                }.first
+        default:
+            return nil
+        }
+    }
+
+    /// The replacement every candidate agrees on, if any.
+    private static func agreed(_ candidates: [HostKeyReplacement]) -> HostKeyReplacement? {
+        guard let first = candidates.first, candidates.allSatisfy({ $0 == first }) else {
+            return nil
+        }
+        return first
     }
 }
