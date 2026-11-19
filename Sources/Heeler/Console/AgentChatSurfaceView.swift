@@ -33,7 +33,8 @@ struct AgentChatSurfaceView: View {
     /// Swaps the detail back to the Agent terminal.
     private let selectSurface: (AgentDetailSurface) -> Void
 
-    @State private var timeline = ChatTimelineModel()
+    @State private var fallbackTimeline = ChatTimelineModel()
+    private var activeTimeline: ChatTimelineModel { chat?.timeline ?? fallbackTimeline }
     @State private var skillsStore: SkillsPaneStore?
     @State private var closer: ClosePaneStore
     /// This view's token with the Chat store, which follows the
@@ -65,7 +66,7 @@ struct AgentChatSurfaceView: View {
     @State private var composerKeyboardPresentation: AgentComposerKeyboardPresentation = .hidden
     @State private var isConfirmingClose = false
     @State private var openCodeEditFlow: HarnessConfigEditFlow?
-    @State private var windowsExtensionFlow: HerdrCoreWindowsExtensionFlow?
+    @State private var extensionFlow: HeelersExtensionFlow?
     @State private var closeRequest = AgentCloseRequest.closeAgent
     @State private var isSelectingPhoto = false
     @State private var isSelectingFile = false
@@ -100,6 +101,7 @@ struct AgentChatSurfaceView: View {
     /// it lists nothing.
     @State private var backgroundWorkHeight: CGFloat = 0
     @State private var isShowingBackgroundWork = false
+    @State private var isShowingSwarm = false
     @State private var isChoosingConversation = false
     /// The row the Background Work sheet opened from.
     @State private var backgroundWorkFocus: String?
@@ -214,7 +216,7 @@ struct AgentChatSurfaceView: View {
             isPresenting: isSelectingPhoto || isSelectingFile || isConfirmingClose
                 || isStartingAgent || isManagingSnippets || isShowingSkillsPicker
                 || viewingSkill != nil || isRenamingAgent || titleRename != nil || isRenamingWorkspace
-                || closeErrorMessage != nil || isShowingBackgroundWork,
+                || closeErrorMessage != nil || isShowingBackgroundWork || isShowingSwarm,
             isOnStage: { @MainActor in isOnStage() },
             toggleInputMode: nil,
             inputMode: .composer))
@@ -274,6 +276,14 @@ struct AgentChatSurfaceView: View {
                     ChatBackgroundWorkSheet(
                         chat: chat, isHostConnected: isHostConnected, focus: backgroundWorkFocus,
                         sheetPresentation: $0)
+                }
+            }
+        }
+        .sheet(isPresented: $isShowingSwarm) {
+            if let chat {
+                ConsoleSheetContent(ConsoleSheetPresentation(horizontalSizeClass: horizontalSizeClass)) {
+                    ChatSwarmSheet(
+                        chat: chat, isHostConnected: isHostConnected, sheetPresentation: $0)
                 }
             }
         }
@@ -379,7 +389,7 @@ struct AgentChatSurfaceView: View {
             defer { PerfTrace.end(span) }
             let transcript = chat?.conversation.transcript
             let entries = feed.history.marking(transcript?.entries ?? [])
-            timeline.update(
+            activeTimeline.updateIfNeeded(
                 conversation: feed.generation,
                 input: ChatTimelineInput(entries: feed.outputs.marking(entries), pending: feed.pending, older: feed.older),
                 turns: transcript?.turns ?? [], precedingTurnEnd: transcript?.precedingTurnEnd, signals: feed.signals,
@@ -583,15 +593,15 @@ struct AgentChatSurfaceView: View {
         HStack(alignment: .bottom, spacing: 0) {
             Spacer(minLength: 0)
             ChatCollapseTrajectoryButton(
-                isVisible: presentation == .timeline && timeline.state.isReady && canCollapseTrajectory
+                isVisible: presentation == .timeline && activeTimeline.state.isReady && canCollapseTrajectory
             ) {
                 collapseRequest += 1
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { collapseControlHeight = $0 }
             ChatMessageJumpControl(
-                showsPrevious: presentation == .timeline && timeline.state.isReady
+                showsPrevious: presentation == .timeline && activeTimeline.state.isReady
                     && (canJumpToPreviousMessage || isHoldingTopJump),
-                showsLatest: presentation == .timeline && timeline.state.isReady && !isFollowing,
+                showsLatest: presentation == .timeline && activeTimeline.state.isReady && !isFollowing,
                 jumpPrevious: { previousMessageRequest += 1 },
                 jumpTop: { topJumpRequest += 1 },
                 jumpTopHoldingChanged: { isHoldingTopJump = $0 },
@@ -626,7 +636,9 @@ struct AgentChatSurfaceView: View {
     private var conversation: some View {
         ZStack(alignment: .top) {
             ChatTimelineView(
-                state: timeline.state, jumpRequest: jumpRequest,
+                state: activeTimeline.state,
+                timelineModel: activeTimeline,
+                jumpRequest: jumpRequest,
                 previousMessageRequest: previousMessageRequest,
                 nextMessageRequest: nextMessageRequest,
                 topJumpRequest: topJumpRequest,
@@ -754,9 +766,9 @@ struct AgentChatSurfaceView: View {
                 showAgentTerminal: { showAgentTerminal() },
                 chooseConversation: offersCandidates ? { isChoosingConversation = true } : nil,
                 reviewEdit: reviewOpenCodeEdit,
-                addExtension: { windowsExtensionFlow = console.windowsExtensionFlow(for: agent.id, keepingTo: session.corePin) })
-            .sheet(item: $windowsExtensionFlow) { flow in
-                HerdrCoreWindowsExtensionSheet(flow: flow)
+                addExtension: { extensionFlow = console.heelersExtensionFlow(for: agent.id, keepingTo: session.corePin) })
+            .sheet(item: $extensionFlow) { flow in
+                HeelersExtensionSheet(flow: flow)
             }
         case .disconnected:
             ContentUnavailableView(
@@ -952,7 +964,7 @@ struct AgentChatSurfaceView: View {
         // while Antigravity CLI's Background Work promotes the Console row.
         let signals = ChatTurnSignals(
             activity: ChatAgentActivity(chat.agent.status),
-            isBackgroundWorkRunning: chat.backgroundWork.rows.contains { $0.isRunning && !$0.isStale },
+            isBackgroundWorkRunning: chat.isBackgroundWorkRunningForTurns,
             foldsFinishedTurns: foldsFinishedTurns,
             isLive: ChatTurnSignals.isLive(hostStatus: console.hostStatuses[agent.hostID], conversation: conversation),
             olderAwaitsUser: conversation.olderAwaitsUser)
@@ -1148,8 +1160,31 @@ struct AgentChatSurfaceView: View {
         .frame(maxWidth: .infinity)
     }
 
+    /// Yields briefly while a visible Chat is confirming its initial transcript
+    /// or filling the first screen, so secondary SSH execs (`readAgentScreen`,
+    /// `claudePermissionLaunch`, `agy models`) do not contend with the initial
+    /// SFTP transcript open.
+    private func waitForInitialTranscriptLoad() async {
+        guard let chat else { return }
+        let deadline = ContinuousClock.now + .seconds(8)
+        while !Task.isCancelled, ContinuousClock.now < deadline, chat.isPerformingForegroundInitialLoad {
+            do {
+                try await Task.sleep(for: .milliseconds(25))
+            } catch {
+                return
+            }
+        }
+    }
+
+    /// Runs a Host script, so only where the Host runs them.
     private func loadAgyModels() async {
-        guard program == .agy, console.isHostReadyForInput(agent.hostID) else { return }
+        guard program == .agy, console.capabilities(for: agent.hostID).hostScripts,
+            console.isHostReadyForInput(agent.hostID)
+        else { return }
+        if agyModels.isEmpty {
+            await waitForInitialTranscriptLoad()
+            guard !Task.isCancelled, console.isHostReadyForInput(agent.hostID) else { return }
+        }
         if let models = try? await console.fetchAgyModels(on: agent.hostID), !models.isEmpty {
             agyModels = models
         }
@@ -1363,6 +1398,10 @@ struct AgentChatSurfaceView: View {
         case .claude:
             session.settingOverrides.refreshPermissionLaunch(nil, liveMode: nil)
             guard status == .idle || status == .done, console.isHostReadyForInput(agent.hostID) else { return }
+            await waitForInitialTranscriptLoad()
+            guard !Task.isCancelled, !isSwitchingSetting, isOnStage(),
+                console.isHostReadyForInput(agent.hostID)
+            else { return }
             var mode: String?
             for attempt in 0..<10 {
                 let screen = try? await readAgentScreen()
@@ -1385,6 +1424,10 @@ struct AgentChatSurfaceView: View {
             session.settingOverrides.refreshPermissionLaunch(launch, liveMode: mode)
         case .agy:
             guard console.isHostReadyForInput(agent.hostID) else { return }
+            await waitForInitialTranscriptLoad()
+            guard !Task.isCancelled, !isSwitchingSetting, isOnStage(),
+                console.isHostReadyForInput(agent.hostID)
+            else { return }
             let attempts = (status == .idle || status == .done) ? 10 : 1
             for attempt in 0..<attempts {
                 let screen = try? await readAgentScreen()
@@ -1410,6 +1453,11 @@ struct AgentChatSurfaceView: View {
             }
         case .codex:
             guard status == .idle || status == .done,
+                console.isHostReadyForInput(agent.hostID),
+                chat?.conversation.transcript.model == nil
+            else { return }
+            await waitForInitialTranscriptLoad()
+            guard !Task.isCancelled, !isSwitchingSetting, isOnStage(),
                 console.isHostReadyForInput(agent.hostID),
                 chat?.conversation.transcript.model == nil
             else { return }
@@ -1760,7 +1808,10 @@ struct AgentChatSurfaceView: View {
         VStack(spacing: 0) {
             if let chat, presentation == .timeline {
                 BackgroundWorkInset(
-                    chat: chat, isHostConnected: isHostConnected, isCondensed: condensesBackgroundWork
+                    chat: chat,
+                    isHostConnected: isHostConnected,
+                    isCondensed: condensesBackgroundWork,
+                    openSwarm: { isShowingSwarm = true }
                 ) { focus in
                     backgroundWorkFocus = focus
                     isShowingBackgroundWork = true
@@ -1800,14 +1851,17 @@ struct AgentChatSurfaceView: View {
     }
 
     private var composerActions: AgentComposerActions {
-        let capabilities = console.capabilities(for: agent.hostID)
+        let removesSavedChat = console.isSavedChat(agent.id)
+        let offers = AgentDetailMenuOffers(
+            capabilities: console.capabilities(for: agent.hostID), workspaceID: agent.agent.workspaceID,
+            removesSavedChat: removesSavedChat)
         return AgentComposerActions(
             canBegin: session.staging.canBegin,
             attachLinkCount: 0,
-            addImage: capabilities.uploads ? { isSelectingPhoto = true } : nil,
-            pasteImage: capabilities.uploads
+            addImage: offers.attachments ? { isSelectingPhoto = true } : nil,
+            pasteImage: offers.attachments
                 ? { composer.enqueueImages([ClipboardImageSelection.current()]) } : nil,
-            addFile: capabilities.uploads ? { isSelectingFile = true } : nil,
+            addFile: offers.attachments ? { isSelectingFile = true } : nil,
             showAttachLinks: {},
             openTerminal: canOpenTerminal
                 ? {
@@ -1816,26 +1870,28 @@ struct AgentChatSurfaceView: View {
                 } : nil,
             isOpeningTerminal: isOpeningTerminal,
             showChanges: showChanges,
-            startAgent: { isStartingAgent = true },
+            startAgent: offers.newAgent ? { isStartingAgent = true } : nil,
             manageSnippets: { isManagingSnippets = true },
             showSkills: skills != nil ? { isShowingSkillsPicker = true } : nil,
             showWorktreeDetails: nil,
-            renameAgent: capabilities.renameAgent ? { isRenamingAgent = true } : nil,
-            renameWorkspace: capabilities.renameWorkspace(id: agent.agent.workspaceID)
-                ? { isRenamingWorkspace = true } : nil,
-            closeAgent: {
-                closeRequest = console.closeRequest(for: agent.id)
-                isConfirmingClose = true
-            },
+            renameAgent: offers.renameAgent ? { isRenamingAgent = true } : nil,
+            renameWorkspace: offers.renameWorkspace ? { isRenamingWorkspace = true } : nil,
+            closeAgent: offers.close
+                ? {
+                    closeRequest = console.closeRequest(for: agent.id)
+                    isConfirmingClose = true
+                } : nil,
             backToConsole: { backToConsole() },
             showAgentTerminal: { showAgentTerminal() },
-            closeConfirmation: AgentCloseConfirmation(
-                title: title,
-                isPresented: $isConfirmingClose,
-                request: closeRequest,
-                removeSavedChat: { if console.removeSavedChat(agent) { onClosed() } },
-                closeAgent: { Task { await performClose() } }),
-            removesSavedChat: console.isSavedChat(agent.id))
+            closeConfirmation: offers.close
+                ? AgentCloseConfirmation(
+                    title: title,
+                    isPresented: $isConfirmingClose,
+                    request: closeRequest,
+                    removeSavedChat: { if console.removeSavedChat(agent) { onClosed() } },
+                    closeAgent: { Task { await performClose() } })
+                : nil,
+            removesSavedChat: removesSavedChat)
     }
 
     /// The More menu's Back to Console: the sidebar beside a detail that
@@ -2009,11 +2065,29 @@ private struct BackgroundWorkInset: View {
     let chat: AgentChatStore
     let isHostConnected: Bool
     let isCondensed: Bool
+    let openSwarm: () -> Void
     let open: (String?) -> Void
 
     var body: some View {
-        ChatBackgroundWorkStrip(
-            work: chat.backgroundWork, isHostConnected: isHostConnected, isCondensed: isCondensed, open: open)
+        VStack(spacing: 0) {
+            if let swarm = chat.agySwarm {
+                ChatSwarmLiveBar(
+                    swarm: swarm,
+                    isCondensed: isCondensed,
+                    open: openSwarm)
+            }
+            let work = chat.backgroundWork
+            let showsFinished = work.showsFinishedInStrip(
+                agentStatus: chat.agent.status,
+                isHostConnected: isHostConnected,
+                turns: chat.conversation.transcript.turns)
+            ChatBackgroundWorkStrip(
+                work: work,
+                isHostConnected: isHostConnected,
+                isCondensed: isCondensed,
+                showsFinishedWork: showsFinished,
+                open: open)
+        }
     }
 }
 

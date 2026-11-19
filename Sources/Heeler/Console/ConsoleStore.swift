@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 /// The Console aggregate: reconciles the Host catalog and publishes one
-/// Agent list with independent Pin and per-Host sidebar ordering. Each ConsoleHostProjection
+/// Agent list with Pin and status-priority ordering across every Server Kind. Each ConsoleHostProjection
 /// owns its own convergence, retry, snippets and Host-scoped RPC behavior.
 /// How a close or a removal ended, for the Console to say with its screen gone.
 struct ConsoleOutcomeNotice: Identifiable, Equatable {
@@ -57,6 +57,10 @@ final class ConsoleStore {
     /// Their empty Agent projection is loading state, not proof that a pane
     /// disappeared.
     private(set) var hostsAwaitingSnapshot: Set<Host.ID> = []
+    /// Panes a connected Host lists without having said yet what holds them.
+    /// A detail open on one waits as it does for a first snapshot: nothing
+    /// says its Agent went.
+    private(set) var panesAwaitingForeground: Set<ConsoleAgent.ID> = []
     /// Hosts whose inventory predates their current connection, including one
     /// replaced silently. Their rows stay listed, but input waits.
     private(set) var hostsAwaitingFreshSnapshot: Set<Host.ID> = []
@@ -114,7 +118,19 @@ final class ConsoleStore {
     /// so a reconnect naturally invalidates, and evicted per Host on insert
     /// so stale generations cannot accumulate.
     @ObservationIgnored private var skillsCache: [SkillsCacheKey: [AgentSkill]] = [:]
+    private struct AccountDirectoriesCacheKey: Hashable {
+        let hostID: Host.ID
+        let generation: UInt64
+        let revision: UInt64
+        let kind: SupportedAgentKind
+    }
+
     @ObservationIgnored private var agyModelsCache: [Host.ID: (generation: UInt64, models: [AgyModelCatalog.Choice])] = [:]
+    @ObservationIgnored private var accountDirectoriesRevisions: [Host.ID: UInt64] = [:]
+    @ObservationIgnored private var accountDirectoriesCache:
+        [AccountDirectoriesCacheKey: (directories: [String], loadedAt: ContinuousClock.Instant)] = [:]
+    @ObservationIgnored private var accountDirectoriesInFlight:
+        [AccountDirectoriesCacheKey: Task<[String], any Error>] = [:]
     /// Status events already converge through each Host's one pane-scoped
     /// subscription. Composers consume this fan-out instead of opening a
     /// second events channel that could outlive the connection snapshot.
@@ -124,7 +140,9 @@ final class ConsoleStore {
     @ObservationIgnored private var gitExecGates: [Host.ID: GitExecGate] = [:]
     /// The Agents list's Changes totals, one store per Agent, shared by
     /// every window's rows and by nothing else.
-    @ObservationIgnored private(set) lazy var rowChanges = AgentRowChanges { [unowned self] agent in
+    @ObservationIgnored private(set) lazy var rowChanges = AgentRowChanges(
+        reads: { [unowned self] agent in capabilities(for: agent.hostID).rowsReadChanges }
+    ) { [unowned self] agent in
         let store = makeChangesStore(
             agentID: agent.id, hostID: agent.hostID, openingDirectory: agent.directory)
         store.onLoaded = { [weak self] changes in
@@ -158,6 +176,7 @@ final class ConsoleStore {
         @Sendable (Host, [EventSubscription]) -> EventsSession
     @ObservationIgnored private let makeCoreSession: @Sendable (Host) -> HerdrCoreHostSession
     @ObservationIgnored private let makeTmuxSession: @Sendable (Host) -> TmuxHostSession
+    @ObservationIgnored private let makeRexSession: @Sendable (Host) -> RexHostSession
     /// Hears the paths a tmux Host's connection resolved again, for the catalog.
     @ObservationIgnored var onTmuxPathsResolved: (@MainActor (Host.ID, TmuxPaths) -> Void)?
     /// A test supplies each Host's projection. Production leaves the choice to
@@ -202,7 +221,7 @@ final class ConsoleStore {
         (@MainActor (Host.ID, String, [String: HerdrCoreTurnState.Mark]) -> Void)?
     @ObservationIgnored private var hostAccountsStores: [Host.ID: HostAccountsStore] = [:]
     /// The device's Launch Presets (#622).
-    let launchPresets = LaunchPresetStore()
+    let launchPresets: LaunchPresetStore
     /// Writes the widgets' snapshot of those readings. Only the app passes
     /// one: demo mode and tests must not replace the real widgets' figures.
     @ObservationIgnored let usageWidgets: AgentUsageWidgetPublisher?
@@ -219,6 +238,7 @@ final class ConsoleStore {
     @ObservationIgnored let chatCache: any ChatTranscriptCache
     let cachedChats: ConsoleChatCache
     @ObservationIgnored private var chatPrefetchTasks: [Host.ID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var chatPrefetchActiveAgent: [Host.ID: ConsoleAgent.ID] = [:]
     @ObservationIgnored private var chatPrefetched: [ConsoleAgent.ID: String] = [:]
     /// Prefetches that found no conversation yet, by the key they ran for.
     @ObservationIgnored private var chatPrefetchRetries: [ConsoleAgent.ID: (key: String, count: Int)] = [:]
@@ -258,6 +278,7 @@ final class ConsoleStore {
         chatCache: any ChatTranscriptCache = VolatileChatTranscriptCache(),
         usageWidgets: AgentUsageWidgetPublisher? = nil,
         usageSettings: AgentUsageSettings = AgentUsageSettings(),
+        launchPresets: LaunchPresetStore = LaunchPresetStore(),
         makeSession: @escaping @Sendable (Host, [EventSubscription]) -> EventsSession =
             ConsoleStore.sshSessionFactory(),
         connectCore: @escaping @Sendable (Host) async throws -> any HerdrCoreTransport =
@@ -271,6 +292,7 @@ final class ConsoleStore {
             ConsoleStore.coreSessionFactory(),
         makeTmuxSession: @escaping @Sendable (Host) -> TmuxHostSession =
             ConsoleStore.tmuxSessionFactory(),
+        makeRexSession: @escaping @Sendable (Host) -> RexHostSession = ConsoleStore.rexSessionFactory(),
         makeProjection: (@MainActor (Host) -> any ConsoleHostProjection)? = nil,
         coreStopClock: BlockedCardClock = .live,
         coreHostMemory: HerdrCoreHostMemory = HerdrCoreHostMemory(),
@@ -296,6 +318,7 @@ final class ConsoleStore {
         self.coreSendClock = coreSendClock
         self.makeCoreSession = makeCoreSession
         self.makeTmuxSession = makeTmuxSession
+        self.makeRexSession = makeRexSession
         self.makeProjection = makeProjection
         self.coreStopClock = coreStopClock
         self.herdrAppRename = herdrAppRename
@@ -308,6 +331,7 @@ final class ConsoleStore {
         cachedChats = ConsoleChatCache(cache: chatCache)
         self.usageWidgets = usageWidgets
         self.usageSettings = usageSettings
+        self.launchPresets = launchPresets
         self.chatAdapter = chatAdapter
         let terminalBudget = TerminalRetentionBudget()
         terminalConnections = TerminalConnectionPool(budget: terminalBudget)
@@ -320,7 +344,11 @@ final class ConsoleStore {
         self.connectCore = connectCore
         self.connectTmux = connectTmux
         cachedChats.onChange = { [weak self] in
-            self?.rebuildChatDisplayAgents()
+            self?.rebuildAgentOrder()
+        }
+        sidebarSnapshots.onLoaded = { [weak self] hostID, snapshot in
+            guard let self, let host = projections[hostID]?.host else { return }
+            cachedChats.record(sidebarSnapshot: snapshot, on: host)
         }
     }
 
@@ -343,15 +371,21 @@ final class ConsoleStore {
         let incoming = Dictionary(hosts.map { ($0.id, $0) }) { _, last in last }
         catalog = hosts
         // A tmux Host's stored paths are what a connection last resolved (ADR
-        // 0044): they move without making it another Host.
+        // 0044), and a Rex Host's first stored socket what one looked up (ADR
+        // 0049): they move without making it another Host.
         for (id, projection) in projections {
-            guard let tmux = projection as? TmuxConsoleProjection, let host = incoming[id] else { continue }
-            tmux.adoptPaths(of: host)
+            guard let host = incoming[id] else { continue }
+            if let tmux = projection as? TmuxConsoleProjection {
+                tmux.adoptPaths(of: host)
+            } else if let rex = projection as? RexConsoleProjection {
+                rex.adoptSocket(of: host)
+            }
         }
         if let hostsOutOfSight {
             let retained = hostsOutOfSight.union(hosts.lazy.filter { $0.serverKind == .herdrCore }.map(\.id))
-            // A tmux Host's server instance is kept where a core Host's core id is.
-            coreHostMemory.retainHosts(retained.union(hosts.lazy.filter { $0.serverKind == .tmux }.map(\.id)))
+            // A tmux or Rex Host's server instance is kept where a core Host's core id is.
+            coreHostMemory.retainHosts(
+                retained.union(hosts.lazy.filter { $0.serverKind == .tmux || $0.serverKind == .rex }.map(\.id)))
             harnessEdits.retainHosts(retained)
             pendingTitleRenames.retainHosts(hostsOutOfSight.union(incoming.keys))
         }
@@ -502,6 +536,65 @@ final class ConsoleStore {
         await task.value
     }
 
+    /// The device's network changed while the app is in front. Every live
+    /// connection is asked whether it survived, as on a foreground return:
+    /// one that did not would otherwise go on holding its Host's route until
+    /// its keepalive noticed (ADR 0058). Stopped Hosts are left alone.
+    func networkPathDidChange() async {
+        await enqueueLifecycleTransition { [self] in
+            guard isActive else { return }
+            let live = projections.values.filter { $0.status == .connected }
+            await withTaskGroup(of: Void.self) { group in
+                for projection in live {
+                    group.addTask { await projection.revalidate() }
+                }
+            }
+        }
+    }
+
+    /// A Server that just lost its connection puts the route in doubt for the
+    /// Host's other Servers, which share it (ADR 0058). Each is asked now
+    /// rather than at its next keepalive: until they notice, they hold the
+    /// route, and the Server reconnecting would follow it nowhere.
+    private func revalidateHostsLosingAServer(
+        from previous: [Host.ID: EventsSessionStatus],
+        to next: [Host.ID: EventsSessionStatus],
+        among current: [any ConsoleHostProjection]
+    ) {
+        let dropped = current.filter { projection in
+            guard previous[projection.host.id] == .connected,
+                case .reconnecting = next[projection.host.id]
+            else { return false }
+            return true
+        }
+        guard !dropped.isEmpty else { return }
+        let machines = Set(dropped.map { HostMachine.Connection($0.host) })
+        for projection in current
+        where next[projection.host.id] == .connected
+            && machines.contains(HostMachine.Connection(projection.host))
+        {
+            Task { await projection.revalidate() }
+        }
+    }
+
+    /// Reconnect on Host detail: the Host forgets its route and every Server
+    /// that is on dials again, so the routes race once and the Servers settle
+    /// on the winner together (ADR 0058).
+    func reconnect(_ machine: HostMachine, leases: HostRouteLeases = .shared) async {
+        await leases.release(machine.id)
+        for server in machine.servers {
+            await retryHost(server.id)
+        }
+    }
+
+    /// Stop on Host detail: every Server of the Host that is still dialing
+    /// stops at once. A connected one is left alone.
+    func stopConnecting(_ machine: HostMachine) async {
+        for server in machine.servers {
+            await cancelHostConnection(server.id)
+        }
+    }
+
     func retryFailedHosts() async {
         for projection in projections.values {
             await projection.retry()
@@ -550,11 +643,10 @@ final class ConsoleStore {
         projections[hostID] as? TmuxConsoleProjection
     }
 
-    /// Whether an address on this Host can come to mean another Terminal: a
-    /// herdr-core Host's under another core, a tmux Host's under another server
-    /// instance. A detail there keeps to the one it opened on.
+    /// Whether an address on this Host can come to mean another Terminal, as the
+    /// Host's projection answers it. A detail there keeps to the one it opened on.
     func keepsDetailsToCores(on hostID: Host.ID) -> Bool {
-        projections[hostID] is HerdrCoreConsoleProjection || projections[hostID] is TmuxConsoleProjection
+        projections[hostID]?.keepsDetailsToInventory == true
     }
 
     func corePin(on hostID: Host.ID) -> TerminalCorePin {
@@ -572,14 +664,14 @@ final class ConsoleStore {
     /// its own words.
     func terminalEndedMessage(keepingTo corePin: TerminalCorePin?, on hostID: Host.ID) -> String? {
         guard hasLeftCore(corePin, on: hostID) else { return nil }
-        return projections[hostID] is TmuxConsoleProjection
-            ? TerminalStatusPresentation.tmuxServerGoneMessage : TerminalStatusPresentation.coreGoneMessage
+        return projections[hostID]?.leftInventoryMessage ?? TerminalStatusPresentation.coreGoneMessage
     }
 
-    /// What an action from a detail that `hasLeftCore` throws: a tmux Host's
-    /// Pane belongs to a server, a core Host's Terminal to a core.
+    /// What an action from a detail that `hasLeftCore` throws, as the Host's
+    /// projection names what its addresses belong to. A Host gone from the
+    /// catalog answers as a core Host.
     func leftCoreError(on hostID: Host.ID) -> TransportError {
-        projections[hostID] is TmuxConsoleProjection ? .tmuxServerGone : .herdrCoreTerminalGone
+        projections[hostID]?.leftInventoryError ?? .herdrCoreTerminalGone
     }
 
     /// What Agent Ended says for `id`, when it has more to say than its plain
@@ -1029,7 +1121,7 @@ final class ConsoleStore {
         let paneID = agent.agent.paneID
         var source = AgentChatSource(
             hostID: hostID, socketLocation: host.socketLocation,
-            files: chatHostFiles(for: hostID),
+            files: chatHostFiles(for: hostID, agentID: agent.id),
             agentInfo: { [weak self] in
                 guard let self else { throw TransportError.cancelled }
                 return try await self.liveChatAgentInfo(hostID: hostID, paneID: paneID)
@@ -1087,8 +1179,11 @@ final class ConsoleStore {
                 self.rebuild()
             }
         }
+        source.onDidBecomeVisible = { [weak self] in
+            self?.preemptBackgroundPrefetchForVisibleChat(agent.id)
+        }
         let rawAgent =
-            projections[hostID]?.agentsByPane[paneID].map { agyTitles.applying(to: $0).agent }
+            projections[hostID]?.agentsByPane[paneID].map { applyingAgyAnnotationTitle(to: $0).agent }
             ?? agent.agent
         let store = AgentChatStore(
             agentID: agent.id, agent: rawAgent, program: program, source: source, timing: chatTiming, now: chatNow)
@@ -1171,21 +1266,40 @@ final class ConsoleStore {
         return try await projection.checkChatSession(paneID: paneID, program: program)
     }
 
+    nonisolated private static let backgroundPrefetchReadChunk = 32 << 10
+
+    private func isBackgroundPrefetchRead(for agentID: ConsoleAgent.ID, on hostID: Host.ID) -> Bool {
+        chatPrefetchActiveAgent[hostID] == agentID && chatStores[agentID]?.isVisible != true
+    }
+
     /// Chat's transcript reads and store queries on the Host's live
     /// connection, resolved on every call like `sessionFileReader(for:)`.
-    func chatHostFiles(for hostID: Host.ID) -> ChatHostFiles {
+    func chatHostFiles(for hostID: Host.ID, agentID: ConsoleAgent.ID? = nil) -> ChatHostFiles {
         ChatHostFiles(
             status: { [weak self] path in
+                try Task.checkCancellation()
                 guard let self else { throw TransportError.cancelled }
                 return try await liveChatHostFiles(for: hostID).status(path)
             },
             list: { [weak self] request in
+                try Task.checkCancellation()
                 guard let self else { throw TransportError.cancelled }
                 return try await liveChatHostFiles(for: hostID).list(request)
             },
             read: { [weak self] range in
+                try Task.checkCancellation()
                 guard let self else { throw TransportError.cancelled }
-                return try await liveChatHostFiles(for: hostID).read(range)
+                var boundedRange = range
+                if let agentID,
+                    boundedRange.maxBytes > Self.backgroundPrefetchReadChunk,
+                    await self.isBackgroundPrefetchRead(for: agentID, on: hostID)
+                {
+                    boundedRange = RemoteFileRange(
+                        path: range.path,
+                        offset: range.offset,
+                        maxBytes: Self.backgroundPrefetchReadChunk)
+                }
+                return try await liveChatHostFiles(for: hostID).read(boundedRange)
             },
             home: { [weak self] in
                 guard let self else { throw TransportError.cancelled }
@@ -1200,12 +1314,102 @@ final class ConsoleStore {
             },
             accountDirectories: { [weak self] kind in
                 guard let self else { throw TransportError.cancelled }
-                return try await liveChatHostFiles(for: hostID).accountDirectories(kind)
+                return try await self.cachedAccountDirectories(for: kind, on: hostID)
             })
     }
 
     private func liveChatHostFiles(for hostID: Host.ID) throws -> ChatHostFiles {
         try projection(for: hostID).chatHostFiles()
+    }
+
+    private static let accountDirectoriesCacheTTL: Duration = .seconds(60)
+
+    private func invalidateCachedAccountDirectories(on hostID: Host.ID) {
+        accountDirectoriesRevisions[hostID, default: 0] &+= 1
+        accountDirectoriesCache = accountDirectoriesCache.filter { $0.key.hostID != hostID }
+        accountDirectoriesInFlight = accountDirectoriesInFlight.filter { $0.key.hostID != hostID }
+    }
+
+    private func cachedAccountDirectories(
+        for kind: SupportedAgentKind, on hostID: Host.ID
+    ) async throws -> [String] {
+        let generation = try projection(for: hostID).transportGeneration
+        let revision = accountDirectoriesRevisions[hostID, default: 0]
+        let key = AccountDirectoriesCacheKey(
+            hostID: hostID, generation: generation, revision: revision, kind: kind)
+        accountDirectoriesCache = accountDirectoriesCache.filter {
+            $0.key.hostID != hostID || ($0.key.generation == generation && $0.key.revision == revision)
+        }
+        if let hit = accountDirectoriesCache[key],
+            ContinuousClock.now - hit.loadedAt < Self.accountDirectoriesCacheTTL
+        {
+            return hit.directories
+        }
+        if let inFlight = accountDirectoriesInFlight[key] {
+            let directories = try await inFlight.value
+            try Task.checkCancellation()
+            return directories
+        }
+        let task = Task<[String], any Error> { [weak self] in
+            guard let self else { throw TransportError.cancelled }
+            return try await self.liveChatHostFiles(for: hostID).accountDirectories(kind)
+        }
+        accountDirectoriesInFlight[key] = task
+        defer {
+            if accountDirectoriesInFlight[key] != nil {
+                accountDirectoriesInFlight[key] = nil
+            }
+        }
+        let directories = try await task.value
+        try Task.checkCancellation()
+        if projections[hostID]?.transportGeneration == generation,
+            accountDirectoriesRevisions[hostID, default: 0] == revision
+        {
+            accountDirectoriesCache[key] = (directories, ContinuousClock.now)
+        }
+        return directories
+    }
+
+    func hasForegroundChatInitialLoad(on hostID: Host.ID) -> Bool {
+        chatStores.contains { $0.key.hostID == hostID && $0.value.isPerformingForegroundInitialLoad }
+    }
+
+    func yieldToForegroundChatLoad(on hostID: Host.ID) async {
+        let deadline = ContinuousClock.now + .seconds(8)
+        while !Task.isCancelled, isActive, ContinuousClock.now < deadline,
+            hasForegroundChatInitialLoad(on: hostID)
+        {
+            try? await Task.sleep(for: .milliseconds(30))
+        }
+    }
+
+    /// Cancels an in-flight background `prefetch()` of another Agent on the
+    /// same Host when a Chat opens on screen and needs the SFTP channel for its
+    /// initial open, resuming background prefetches once foreground loading
+    /// settles.
+    private func preemptBackgroundPrefetchForVisibleChat(_ visibleAgentID: ConsoleAgent.ID) {
+        let hostID = visibleAgentID.hostID
+        guard let chat = chatStores[visibleAgentID], chat.isPerformingForegroundInitialLoad else { return }
+        var preemptedPrefetch = false
+        if let runningTask = chatPrefetchTasks[hostID],
+            let activePrefetch = chatPrefetchActiveAgent[hostID],
+            activePrefetch != visibleAgentID
+        {
+            runningTask.cancel()
+            chatPrefetchTasks[hostID] = nil
+            chatPrefetchActiveAgent[hostID] = nil
+            chatPrefetched[activePrefetch] = nil
+            preemptedPrefetch = true
+        }
+        let preemptedAgyTitles = agyTitles.cancelInFlight(on: hostID)
+        guard preemptedPrefetch || preemptedAgyTitles else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.yieldToForegroundChatLoad(on: hostID)
+            guard self.isActive else { return }
+            if preemptedPrefetch { self.reconcileChatCache() }
+            if preemptedAgyTitles { self.reconcileAgyAnnotationTitles() }
+        }
     }
 
     private func liveChatAgentInfo(hostID: Host.ID, paneID: String) async throws -> Agent {
@@ -1215,8 +1419,15 @@ final class ConsoleStore {
         let fresh = try await origin.agentInfo(paneID: paneID)
         guard projections[hostID] === origin, origin.transportGeneration == generation,
             !origin.isAwaitingSnapshot else { throw TransportError.cancelled }
-        let enriched = await readAgyTitleForRename(
-            fresh: fresh, paneID: paneID, hostID: hostID, generation: generation)
+        let agentID = ConsoleAgent.ID(hostID: hostID, paneID: paneID)
+        let defersUncachedAgyLocate =
+            chatStores[agentID]?.isPerformingForegroundInitialLoad == true
+            && !agyTitles.hasCachedResolution(for: fresh, paneID: paneID, on: hostID, generation: generation)
+        let enriched =
+            defersUncachedAgyLocate
+            ? fresh
+            : await readAgyTitleForRename(
+                fresh: fresh, paneID: paneID, hostID: hostID, generation: generation)
         guard projections[hostID] === origin, origin.transportGeneration == generation,
             !origin.isAwaitingSnapshot else { throw TransportError.cancelled }
         if hostPlatforms[hostID] == .posix, let snapshot,
@@ -1224,7 +1435,19 @@ final class ConsoleStore {
             origin.agentsByPane[paneID]?.agent.terminalID == snapshot.agent.terminalID,
             origin.agentsByPane[paneID]?.agent.workspaceID == snapshot.agent.workspaceID,
             origin.agentsByPane[paneID]?.agent.tabID == snapshot.agent.tabID {
-            cachedChats.confirm(enriched, for: snapshot, on: origin.host)
+            var freshRow = snapshot
+            freshRow.agent = fresh
+            let resolvedTitle =
+                agyTitles.knownTitle(for: fresh, id: agentID)
+                ?? (agyTitles.hasResolvedState(for: freshRow)
+                    ? nil
+                    : cachedChats.cachedConversationTitle(for: fresh, on: origin.host))
+            let cachedFresh = resolvedTitle.map(fresh.applyingConversationTitle) ?? fresh
+            cachedChats.confirm(
+                cachedFresh, for: snapshot, conversationTitle: resolvedTitle, on: origin.host)
+            if defersUncachedAgyLocate {
+                return cachedFresh
+            }
         }
         return enriched
     }
@@ -1550,9 +1773,10 @@ final class ConsoleStore {
         try await projection(for: hostID).focusAgent(paneID)
     }
 
-    /// Which Agent one Agent detail shows now, nil once it shows none. On a core
-    /// Host this is what Done per device reads: a shown Agent's turns are seen as
-    /// they end, whichever window shows it.
+    /// Which Agent one Agent detail shows now, on either surface, nil once it
+    /// shows none. On a core, tmux or Rex Host this is what Done per device
+    /// reads: a shown Agent's turns are seen as they end, whichever window
+    /// shows it.
     func setAgentShown(_ agent: ConsoleAgent.ID?, viewer: UUID, scene: UUID?) {
         // A window that ended may still run a late update.
         let shown = scene.map(endedScenes.contains) == true ? nil : agent
@@ -1676,8 +1900,23 @@ final class ConsoleStore {
                 sleep: pendingTitleRenameSleep))
     }
 
+    private func applyingAgyAnnotationTitle(to row: ConsoleAgent) -> ConsoleAgent {
+        let resolved = agyTitles.applying(to: row)
+        if resolved != row || row.agent.kind != ChatProgram.agy.rawValue
+            || agyTitles.hasResolvedState(for: row)
+        {
+            return resolved
+        }
+        guard let host = projections[row.hostID]?.host,
+            let saved = cachedChats.cachedConversationTitle(for: row.agent, on: host)
+        else { return row }
+        var copy = row
+        copy.agent = copy.agent.applyingConversationTitle(saved)
+        return copy
+    }
+
     private func applyingClientTitles(to row: ConsoleAgent) -> ConsoleAgent {
-        pendingTitleRenames.applying(to: agyTitles.applying(to: row))
+        pendingTitleRenames.applying(to: applyingAgyAnnotationTitle(to: row))
     }
 
     private func isAgentBusyInConsole(_ id: ConsoleAgent.ID) -> Bool {
@@ -1994,6 +2233,10 @@ final class ConsoleStore {
                             self?.onCoreSeenMarksChanged?(id, core, marks)
                         },
                         onChange: onChange)
+                case .rex:
+                    RexConsoleProjection(
+                        host: host, session: makeRexSession(host), memory: coreHostMemory, pins: pins,
+                        onChange: onChange)
                 case .herdrTUI, .unconfirmed:
                     HostConsoleProjection(
                         host: host,
@@ -2037,6 +2280,7 @@ final class ConsoleStore {
                 (projection.host.id, projection.status ?? .connecting)
             })
         if hostStatuses != nextStatuses { hostStatuses = nextStatuses }
+        revalidateHostsLosingAServer(from: previousStatuses, to: nextStatuses, among: current)
         for (id, store) in agentUsageStores
         where nextStatuses[id] == .connected && previousStatuses[id] != .connected {
             store.connectionBecameUsable()
@@ -2108,6 +2352,13 @@ final class ConsoleStore {
             current.lazy.filter(\.isAwaitingSnapshot).map(\.host.id))
         if hostsAwaitingSnapshot != nextAwaitingSnapshot {
             hostsAwaitingSnapshot = nextAwaitingSnapshot
+        }
+        let nextAwaitingForeground = Set(
+            current.lazy.flatMap { projection in
+                projection.panesAwaitingForeground.map { ConsoleAgent.ID(hostID: projection.host.id, paneID: $0) }
+            })
+        if panesAwaitingForeground != nextAwaitingForeground {
+            panesAwaitingForeground = nextAwaitingForeground
         }
         let nextAwaitingFreshSnapshot = Set(
             current.lazy.filter(\.isAwaitingFreshSnapshot).map(\.host.id))
@@ -2207,15 +2458,20 @@ final class ConsoleStore {
                 terminalSnapshotRevisions[hostID] != projection.sidebarRevision
             else { continue }
             terminalSnapshotRevisions[hostID] = projection.sidebarRevision
+            // An Agent's terminal is its detail's, on a Rex Host too (ADR 0056):
+            // each block has one holder.
             let identities = Set(
                 projection.terminalsByPane.values.filter { !$0.isAgent }.map {
                     ShellTerminalIdentity(
                         paneID: $0.paneID, tabID: $0.tabID, terminalID: $0.terminalID)
                 })
             let revision = projection.sidebarRevision
-            // Only a tmux Host can restart its server on the same SSH connection and
-            // reuse an address such as `%0` without bumping `transportGeneration`.
-            let tmuxServerInstance = projection.host.serverKind == .tmux ? projection.inventoryCore : nil
+            // A tmux or Rex Host can restart its server on the same SSH connection,
+            // and a tmux one reuse an address such as `%0`, without bumping
+            // `transportGeneration`.
+            let kind = projection.host.serverKind
+            let serverInstance = kind == .tmux || kind == .rex ? projection.inventoryCore : nil
+            let tmuxServerInstance = kind == .tmux ? serverInstance : nil
             // A detail stays on a departed Agent, and so does its terminal.
             let agents = Array(projection.agentsByPane.values)
                 + Array(projection.departedAgentsByPane.values)
@@ -2226,7 +2482,7 @@ final class ConsoleStore {
             }
             Task {
                 await terminalConnections.reconcile(
-                    hostID: hostID, identities: identities, tmuxServerInstance: tmuxServerInstance,
+                    hostID: hostID, identities: identities, serverInstance: serverInstance,
                     isCurrent: isCurrent)
                 await agentTerminals.reconcile(
                     hostID: hostID, agents: agents, tmuxServerInstance: tmuxServerInstance, isCurrent: isCurrent)
@@ -2243,7 +2499,9 @@ final class ConsoleStore {
         for projection in current
         where projection.status == .connected && !projection.isAwaitingSnapshot {
             let hostID = projection.host.id
-            guard hostPlatformGenerations[hostID] != projection.transportGeneration,
+            // A Rex Host is POSIX without a probe (ADR 0056).
+            guard projection.host.serverKind != .rex,
+                hostPlatformGenerations[hostID] != projection.transportGeneration,
                 mayOfferChat(on: projection)
                     || (projection.host.serverKind == .herdrCore
                         && (herdrAppRename || composerSessions.keys.contains { $0.hostID == hostID }))
@@ -2264,10 +2522,33 @@ final class ConsoleStore {
         terminals.filter { $0.hostID == hostID && $0.workspaceID == workspaceID }
     }
 
+    private func effectiveSidebarSnapshot(for hostID: Host.ID) -> AgentRowLayoutSnapshot? {
+        if let snapshot = sidebarSnapshots.snapshot(for: hostID) {
+            return snapshot
+        }
+        guard let host = projections[hostID]?.host,
+            let cached = cachedChats.sidebarSnapshot(on: host),
+            isActive || !cachedChats.agents(on: host).isEmpty
+        else { return nil }
+        if case .loaded(nil) = sidebarSnapshots.states[hostID] {
+            return nil
+        }
+        return cached
+    }
+
+    /// A core, tmux or Rex Host follows no plugin, and starts from
+    /// `rowLayoutWithoutPlugin`.
     func rowLayout(for hostID: Host.ID) -> AgentRowLayout {
-        rowLayouts.resolvedLayout(
-            for: hostID, pluginSnapshot: sidebarSnapshots.snapshot(for: hostID),
-            followsPlugin: coreHost(hostID) == nil)
+        let kind = catalog.first { $0.id == hostID }?.serverKind
+        return rowLayouts.resolvedLayout(
+            for: hostID, pluginSnapshot: effectiveSidebarSnapshot(for: hostID),
+            followsPlugin: kind == nil || kind == .herdrTUI, withoutPlugin: .withoutPlugin(on: kind))
+    }
+
+    /// Where the rows of a Host that follows no plugin start until it saves
+    /// its own, which Agent List Fields starts editing from too.
+    func rowLayoutWithoutPlugin(for hostID: Host.ID) -> AgentRowLayout {
+        .withoutPlugin(on: catalog.first { $0.id == hostID }?.serverKind)
     }
 
     /// The fields this Host's Live Activity carries. Label fields are only for
@@ -2516,10 +2797,10 @@ final class ConsoleStore {
     }
 
     /// Antigravity CLI's `PreInvocation` hook reports `Idle` once its
-    /// foreground turn finishes, even while its Subagents, Workflows, or
-    /// non-daemon background commands keep running. Present the Agent as
-    /// `Working` across Console and Composer surfaces while a live connected
-    /// transcript confirms running, non-stale Background Work.
+    /// foreground turn finishes, even while its Subagents, Workflows, Swarm
+    /// task workers, or non-daemon background commands keep running. Present
+    /// the Agent as `Working` across Console and Composer surfaces while a live
+    /// connected transcript confirms running, non-stale Background Work.
     private func applyingAgyBackgroundWork(to row: ConsoleAgent) -> ConsoleAgent {
         guard row.agent.kind == ChatProgram.agy.rawValue,
             row.agent.status == .idle || row.agent.status == .done,
@@ -2540,23 +2821,21 @@ final class ConsoleStore {
         return copy
     }
 
+    private func catalogServerOrder() -> [Host.ID: Int] {
+        Dictionary(catalog.enumerated().map { ($0.element.id, $0.offset) }) { first, _ in first }
+    }
+
     private func rebuildAgentOrder() {
         let span = PerfTrace.begin("console.rebuild.order")
         defer { PerfTrace.end(span) }
         let unsorted = projections.values.flatMap { $0.agentsByPane.values }
             .map { applyingAgyBackgroundWork(to: applyingClientTitles(to: $0)) }
-        // A Host with no plugin has no snapshot to say: it keeps status priority,
-        // and within a status the order its projection lists, the desktop app's.
-        let sorts = Dictionary(uniqueKeysWithValues: projections.compactMap { id, projection in
-            projection.host.capabilities.syncLayoutFromPlugin
-                ? sidebarSnapshots.snapshot(for: id).map { (id, $0.agentPanelSort) }
-                : (id, AgentPanelSort.priority)
-        })
+        let serverOrder = catalogServerOrder()
         let pinRanks = Dictionary(uniqueKeysWithValues: unsorted.compactMap { agent in
             pins.pinRank(hostID: agent.hostID, paneID: agent.agent.paneID)
                 .map { (agent.id, $0) }
         })
-        let nextAgents = unsorted.consoleSorted(sortByHost: sorts) { pinRanks[$0.id] }
+        let nextAgents = unsorted.consoleSorted(serverOrder: serverOrder) { pinRanks[$0.id] }
         if agents != nextAgents { agents = nextAgents }
         let listed = Set(unsorted.map(\.id))
         if listedAgentIDs != listed { listedAgentIDs = listed }
@@ -2623,7 +2902,9 @@ final class ConsoleStore {
         let savedPairs = projections.values.flatMap {
             projection -> [(agent: ConsoleAgent, readiness: HostReadiness)] in
             guard projection.showsSavedChats else { return [] }
-            let saved = cachedChats.agents(on: projection.host).filter { !live.contains($0.id) }
+            let saved = cachedChats.agents(on: projection.host)
+                .filter { !live.contains($0.id) }
+                .map { pendingTitleRenames.applying(to: $0) }
             guard !saved.isEmpty else { return [] }
             let hostReadiness = readiness(of: projection.host)
             return saved.map { ($0, hostReadiness) }
@@ -2634,9 +2915,10 @@ final class ConsoleStore {
             nextDisplay = agents
             nextSavedEntries = [:]
         } else {
+            let serverOrder = catalogServerOrder()
             nextDisplay =
                 agents
-                + savedPairs.map(\.agent).consoleSorted(sortByHost: [:]) { [pins] in
+                + savedPairs.map(\.agent).consoleSorted(serverOrder: serverOrder) { [pins] in
                     pins.pinRank(hostID: $0.id.hostID, paneID: $0.id.paneID)
                 }
             nextSavedEntries = Dictionary(savedPairs.map { ($0.agent.id, $0.readiness) }) {
@@ -2815,11 +3097,55 @@ final class ConsoleStore {
             })
     }
 
+    /// What a Chat that can't bind a Pi or Oh My Pi offers where no Host Helper
+    /// brings Heeler's extension: a Rex Host's flow, else a native Windows core
+    /// Host's.
+    func heelersExtensionFlow(
+        for agentID: ConsoleAgent.ID, keepingTo corePin: TerminalCorePin? = nil
+    ) -> HeelersExtensionFlow {
+        projections[agentID.hostID] is RexConsoleProjection
+            ? rexExtensionFlow(for: agentID, keepingTo: corePin)
+            : windowsExtensionFlow(for: agentID, keepingTo: corePin)
+    }
+
+    /// Heeler's extension for the Pi or Oh My Pi in a Rex terminal (ADR 0056): the one
+    /// folder that Agent loads its extensions from, found from its own process, and
+    /// one file written there over SFTP once the user confirms. A detail keeps to its
+    /// own server: one that has moved on writes nothing.
+    func rexExtensionFlow(
+        for agentID: ConsoleAgent.ID, keepingTo corePin: TerminalCorePin? = nil
+    ) -> HeelersExtensionFlow {
+        let hostID = agentID.hostID
+        func rex(of store: ConsoleStore) throws -> RexConsoleProjection {
+            guard !store.hasLeftCore(corePin, on: hostID) else { throw store.leftCoreError(on: hostID) }
+            guard let rex = store.projections[hostID] as? RexConsoleProjection else {
+                throw TransportError.cancelled
+            }
+            return rex
+        }
+        return HeelersExtensionFlow(
+            readyFooter: String(
+                localized: "Expect this Agent's program to load what is in this folder for every session on this Host. In a Rex terminal the extension keeps which conversation a session is in, in a small file of its own under heeler-session beside this folder, and Chat reads it there."),
+            locate: { [weak self] in
+                guard let self else { throw TransportError.cancelled }
+                return [try await rex(of: self).chatExtensionFolder(paneID: agentID.paneID)]
+            },
+            write: { [weak self] folders in
+                guard let self else { throw TransportError.cancelled }
+                guard let contents = try self.hostHelperBundle().files[HostHelperScript.extensionPath] else {
+                    throw HostHelperBundle.LoadError.unreadable(HostHelperScript.extensionPath)
+                }
+                for folder in folders {
+                    try await rex(of: self).placeChatExtension(contents, inFolder: folder, keepingTo: corePin)
+                }
+            })
+    }
+
     /// Heeler's extension on a native Windows core Host (ADR 0033). A detail keeps to
     /// its own core: a Host that has moved on writes nothing more, even part way.
     func windowsExtensionFlow(
         for agentID: ConsoleAgent.ID, keepingTo corePin: TerminalCorePin? = nil
-    ) -> HerdrCoreWindowsExtensionFlow {
+    ) -> HeelersExtensionFlow {
         let hostID = agentID.hostID
         func core(of store: ConsoleStore) throws -> HerdrCoreConsoleProjection {
             guard !store.hasLeftCore(corePin, on: hostID) else { throw store.leftCoreError(on: hostID) }
@@ -2828,7 +3154,7 @@ final class ConsoleStore {
             }
             return core
         }
-        return HerdrCoreWindowsExtensionFlow(
+        return HeelersExtensionFlow(
             locate: { [weak self] in
                 guard let self else { throw TransportError.cancelled }
                 return try await core(of: self).windowsExtensionFolders()
@@ -2928,6 +3254,9 @@ final class ConsoleStore {
                     && expected.status == .connected
                     && !expected.isAwaitingSnapshot
                     && expected.transportGeneration == generation
+            },
+            awaitForegroundReady: { [weak self] hostID in
+                await self?.yieldToForegroundChatLoad(on: hostID)
             },
             onReconcileNeeded: { [weak self] in
                 self?.reconcileAgyAnnotationTitles()
@@ -3043,9 +3372,9 @@ final class ConsoleStore {
         if let program = ChatProgram(rawValue: agent.agent.kind), !capabilities.offersChat(for: program) {
             return nil
         }
-        let platform =
-            hostPlatforms[agent.hostID]
-            ?? (catalog.first(where: { $0.id == agent.hostID })?.serverKind == .tmux ? .posix : nil)
+        // A tmux or Rex Host is POSIX without asking it (ADRs 0044 and 0056).
+        let kind = catalog.first(where: { $0.id == agent.hostID })?.serverKind
+        let platform = hostPlatforms[agent.hostID] ?? (kind == .tmux || kind == .rex ? .posix : nil)
         if let platform {
             return AgentChatAvailability.program(
                 for: agent.agent, platform: platform, isNativeWindowsCore: capabilities.isNativeWindowsCore,
@@ -3075,9 +3404,25 @@ final class ConsoleStore {
                 chatCacheValidatedGenerations[host.id] = projection.transportGeneration
                 cachedChats.revalidate(on: host)
             }
-            cachedChats.observe(
-                projection.agentsByPane.values.map { agyTitles.applying(to: $0) },
-                on: host)
+            var conversationTitles: [ConsoleAgent.ID: String] = [:]
+            let observed = projection.agentsByPane.values.map { row -> ConsoleAgent in
+                if let title = agyTitles.knownTitle(for: row.agent, id: row.id) {
+                    conversationTitles[row.id] = title
+                    var copy = row
+                    copy.agent = copy.agent.applyingConversationTitle(title)
+                    return copy
+                }
+                if row.agent.kind == ChatProgram.agy.rawValue, !agyTitles.hasResolvedState(for: row),
+                    let saved = cachedChats.cachedConversationTitle(for: row.agent, on: host)
+                {
+                    conversationTitles[row.id] = saved
+                    var copy = row
+                    copy.agent = copy.agent.applyingConversationTitle(saved)
+                    return copy
+                }
+                return row
+            }
+            cachedChats.observe(observed, conversationTitles: conversationTitles, on: host)
             guard chatPrefetchTasks[host.id] == nil else { continue }
             let generation = projection.transportGeneration
             let candidates = projection.agentsByPane.values.filter { agent in
@@ -3100,12 +3445,22 @@ final class ConsoleStore {
                         projection.transportGeneration == generation else { break }
                     guard let program = ChatProgram(rawValue: agent.agent.kind),
                         let chat = chatStore(for: agent, program: program) else { continue }
+                    if !chat.isVisible {
+                        await yieldToForegroundChatLoad(on: host.id)
+                        guard !Task.isCancelled, isActive, projections[host.id] === projection,
+                            projection.status == .connected, !projection.isAwaitingSnapshot,
+                            projection.transportGeneration == generation else { break }
+                    }
                     let key = chatPrefetchKey(agent, generation: generation)
                     chatPrefetched[agent.id] = key
+                    chatPrefetchActiveAgent[host.id] = agent.id
                     let read = PerfTrace.beginInterval("chat.prefetch", "pane=\(agent.agent.paneID)")
                     let prefetched = await chat.prefetch()
                     PerfTrace.endInterval(
                         read, "ok=\(prefetched) entries=\(chat.conversation.transcript.entries.count)")
+                    if chatPrefetchActiveAgent[host.id] == agent.id {
+                        chatPrefetchActiveAgent[host.id] = nil
+                    }
                     guard !Task.isCancelled else { return }
                     let snapshot = chat.conversation
                     let retries = chatPrefetchRetries[agent.id].flatMap { $0.key == key ? $0.count : nil } ?? 0
@@ -3163,7 +3518,7 @@ final class ConsoleStore {
         let current = Dictionary(
             projections.values.flatMap { $0.agentsByPane.values }
                 .map { row in
-                    let titled = agyTitles.applying(to: row)
+                    let titled = applyingAgyAnnotationTitle(to: row)
                     return (titled.id, titled)
                 }
         ) { first, _ in first }
@@ -3275,6 +3630,7 @@ extension ConsoleStore: NotificationTransportProvider {
         for hostID: Host.ID,
         _ operation: @escaping @Sendable (any HostServices & HostNotificationFiles) async throws -> Void
     ) async throws {
+        defer { invalidateCachedAccountDirectories(on: hostID) }
         if let host = coreHost(hostID) {
             try await withCoreConnection(host) { transport in
                 try await operation(HostHelperUsageHost(
@@ -3409,6 +3765,24 @@ extension ConsoleStore {
         }
     }
 
+    /// Which of a Host's routes, by index, reaches it now, under the
+    /// Console's trust rules: a key that still needs trusting is declined
+    /// (ADR 0058).
+    static func sshRouteProbe(
+        connector: any TransportConnector = SSHTransportConnector(),
+        knownHosts: any KnownHostsStore = UserDefaultsKnownHostsStore.shared,
+        credentials: HostCredentialsProvider = HostCredentialsProvider(),
+        overlays: OverlayNetworkRuntime = .shared
+    ) -> @Sendable (Host, [Int]) async -> Int? {
+        { host, candidates in
+            guard
+                let settings = try? consoleSettings(
+                    for: host, knownHosts: knownHosts, credentials: credentials, overlays: overlays)
+            else { return nil }
+            return await connector.reachableRoute(among: candidates, settings: settings)
+        }
+    }
+
     /// The production session factory: SSH transports built from the Host
     /// catalog's credentials. TOFU is restricted to already-trusted
     /// fingerprints; the Console never prompts.
@@ -3457,6 +3831,25 @@ extension ConsoleStore {
                     for: host, knownHosts: knownHosts, credentials: credentials, overlays: overlays)
                 settings.tmuxPaths = paths
                 return try await connector.connectTmux(settings: settings)
+            }
+        }
+    }
+
+    /// The Rex Hosts' equivalent, with the same trust rules. Each connection
+    /// starts from the socket the session holds: the catalog's, then the one
+    /// a connection found.
+    static func rexSessionFactory(
+        connector: any TransportConnector = SSHTransportConnector(),
+        knownHosts: any KnownHostsStore = UserDefaultsKnownHostsStore.shared,
+        credentials: HostCredentialsProvider = HostCredentialsProvider(),
+        overlays: OverlayNetworkRuntime = .shared
+    ) -> @Sendable (Host) -> RexHostSession {
+        { host in
+            RexHostSession(storedSocket: host.rexSocket) { socket, previous in
+                var settings = try consoleSettings(
+                    for: host, knownHosts: knownHosts, credentials: credentials, overlays: overlays)
+                settings.rexSocket = socket
+                return try await connector.connectRex(settings: settings, resuming: previous)
             }
         }
     }

@@ -372,6 +372,53 @@ struct ConsoleStoreTests {
         #expect(await condition(), comment)
     }
 
+    /// A Host's Servers share its route, so one of them losing its link asks
+    /// the others at once instead of at their next keepalive (ADR 0058).
+    @Test func aServerLosingItsLinkAsksTheHostsOtherServers() async throws {
+        let first = Host(address: "box.example", username: "dev")
+        let second = Host(address: "box.example", username: "dev", sessionName: "work")
+        let elsewhere = Host(address: "other.example", username: "dev")
+        let transports = [
+            first.id: ScriptedTransport(), second.id: ScriptedTransport(),
+            elsewhere.id: ScriptedTransport(),
+        ]
+        let store = makeStore(transports: transports)
+        store.setHosts([first, second, elsewhere])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("every Server connects") {
+            [first, second, elsewhere].allSatisfy { store.hostStatuses[$0.id] == .connected }
+        }
+        let sibling = try #require(transports[second.id])
+        let stranger = try #require(transports[elsewhere.id])
+        let siblingPings = await sibling.pingCount
+        let strangerPings = await stranger.pingCount
+
+        await transports[first.id]?.failEventStream(.sshUnreachable(detail: "link down"))
+
+        try await waitUntil("the Host's other Server is asked") {
+            await sibling.pingCount > siblingPings
+        }
+        #expect(await stranger.pingCount == strangerPings)
+    }
+
+    /// A network change asks every live connection whether it survived
+    /// (ADR 0058).
+    @Test func aNetworkChangeAsksEveryLiveConnection() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport()
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the Host connects") { store.hostStatuses[host.id] == .connected }
+        let pings = await transport.pingCount
+
+        await store.networkPathDidChange()
+
+        try await waitUntil("the connection is asked") { await transport.pingCount > pings }
+    }
+
     @Test func aLaunchReadsTheCurrentAccountVariableAndRefusesAReadFailure() async throws {
         let host = Host.fixture()
         let transport = ScriptedTransport()
@@ -959,6 +1006,7 @@ struct ConsoleStoreTests {
         await knownHosts.setFingerprint(
             HostKeyFingerprint(publicKeyBlob: Data("key".utf8)), host: trust.host, port: trust.port)
         let recents = RecentLaunchStore(defaults: defaults)
+        recents.rememberHost(host.id)
         recents.rememberWorkspace("w1", for: host.id)
         let dependencies = HostRemovalDependencies.app(
             console: console, notificationPreferences: preferences,
@@ -979,6 +1027,8 @@ struct ConsoleStoreTests {
         #expect(file.devices.isEmpty)
         #expect(await knownHosts.fingerprints(host: trust.host, port: trust.port).isEmpty)
         #expect(recents.workspaceID(for: host.id) == nil)
+        #expect(recents.preferredHostID(in: [host]) == nil)
+        #expect(defaults.object(forKey: "recent-host-ids") == nil)
         #expect(defaults.object(forKey: "live-activity.enabled-hosts") == nil)
 
         // What the app model's catalog observer does next.
@@ -2545,6 +2595,71 @@ struct ConsoleStoreTests {
         #expect(await transport.agentFocuses.isEmpty)
     }
 
+    @Test func leavingDetailWhileFocusIsQueuedStillDeliversFocusAndResnapshots() async throws {
+        let host = Host.fixture()
+        let paneID = "w1N:p5H"
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: paneID, status: .done)]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the Done Agent should arrive") {
+            store.agents.first?.agent.status == .done
+        }
+        await store.refreshSidebarLayouts()
+
+        let focusGate = ScriptedTransportCallGate()
+        await transport.gateNextFocus(using: focusGate)
+        await transport.setSnapshot(.fixture(agents: [.fixture(paneID: paneID, status: .idle)]))
+
+        // Viewer task starts focusAgent, then gets cancelled as the user navigates Back.
+        let viewerTask = Task {
+            try await store.focusAgent(paneID, on: host.id)
+        }
+        await focusGate.waitForEntry()
+        viewerTask.cancel()
+
+        // Re-entry while still queued coalesces onto the same in-flight RPC.
+        let reentryTask = Task {
+            try await store.focusAgent(paneID, on: host.id)
+        }
+        try await Task.sleep(for: .milliseconds(15))
+        await focusGate.open()
+        try await reentryTask.value
+
+        #expect(await transport.agentFocuses == [AgentTarget(target: paneID)])
+        try await waitUntil("the row should transition from Done to Idle") {
+            store.agents.first?.agent.status == .idle
+        }
+    }
+
+    @Test func hostSuspendCancelsQueuedProjectionFocusBeforeDispatch() async throws {
+        let host = Host.fixture()
+        let paneID = "w1N:p5H"
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: paneID, status: .done)]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the Done Agent should arrive") {
+            store.agents.first?.agent.status == .done
+        }
+
+        let focusGate = ScriptedTransportCallGate()
+        await transport.gateNextFocus(using: focusGate)
+        let viewerTask = Task {
+            try await store.focusAgent(paneID, on: host.id)
+        }
+        await focusGate.waitForEntry()
+        viewerTask.cancel()
+        await store.suspend()
+        await focusGate.open()
+        try await Task.sleep(for: .milliseconds(25))
+        #expect(await transport.agentFocuses.isEmpty)
+    }
+
     @Test func renameAgentForwardsItsParamsAndResnapshots() async throws {
         // agent.rename (#98): the params reach the Host's transport, and the
         // new name lands via one explicit resync — pane.updated is not a
@@ -3485,7 +3600,7 @@ struct ConsoleStoreTests {
 /// Hands out scripted transports in order, one per `connect`, so tests can
 /// drive SSH-level replacement deterministically.
 /// A Host that refuses every connection until the test brings it up.
-private actor HostReachability {
+actor HostReachability {
     private var isOnline = false
 
     func comeOnline() { isOnline = true }

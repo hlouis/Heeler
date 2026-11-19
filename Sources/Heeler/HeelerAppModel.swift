@@ -126,9 +126,14 @@ final class HeelerAppModel {
             },
             harnessEdits: console.harnessEdits,
             noteWindowsCore: { [weak console] in console?.noteWindowsCore(on: $0) },
+            retryFailedHost: { [weak console] id in
+                guard let console, case .failed = console.hostStatuses[id] else { return }
+                Task { await console.retryHost(id) }
+            },
             coreKernel: { [weak console] in console?.hostCoreKernels[$0] },
             noteTmuxPaths: { [weak hostStore] id, paths in try? hostStore?.noteTmuxPaths(paths, for: id) },
-            notePlugin: { [weak hostUpdates] id, status in hostUpdates?.notePlugin(status, for: id) })
+            notePlugin: { [weak hostUpdates] id, status in hostUpdates?.notePlugin(status, for: id) },
+            noteRexSocket: { [weak hostStore] id, socket in try? hostStore?.noteRexSocket(socket, for: id) })
         // The in-app foreground banner (#77): presented-Agent suppression
         // reads the key window's Agent at fire time; the preference gate
         // reads each Host's confirmed notify flags and fails closed on
@@ -168,11 +173,15 @@ final class HeelerAppModel {
                 hostStore?.supportsLiveActivities(for: id) ?? false
             },
             registrationGate: { [weak hostStore, weak notificationPreferences] id in
-                let kind = hostStore?.hosts.first(where: { $0.id == id })?.serverKind
-                guard kind == .herdrCore || kind == .tmux else {
+                switch hostStore?.hosts.first(where: { $0.id == id })?.serverKind {
+                case .herdrCore, .tmux:
+                    return notificationPreferences?.liveActivityGate(forCoreHost: id) ?? .unknown
+                // A Rex Host registers nothing (ADR 0049).
+                case .rex:
+                    return .closed
+                case .herdrTUI, .unconfirmed, nil:
                     return .open
                 }
-                return notificationPreferences?.liveActivityGate(forCoreHost: id) ?? .unknown
             },
             pinnedPaneIDs: { [weak console] id in
                 console?.pins.pinnedPaneIDs(for: id) ?? []
@@ -234,13 +243,31 @@ final class HeelerAppModel {
         // Console resumes, pending browser sign-ins also resume, even when
         // no Host has been added to bring their nodes back up with a dial.
         let overlayNetworks = overlayNetworks
+        // A Host keeps the route its connections hold, so one that settled on
+        // an Overlay Network or a Jump Host is looked at again when a direct
+        // route may have come into reach: on a foreground return, and when
+        // the device's network changes (ADR 0058).
+        let routeUpgrader = HostRouteUpgrader(
+            machines: { [hostStore] in hostStore.machines },
+            isConnected: { [console] id in console.hostStatuses[id] == .connected },
+            probe: ConsoleStore.sshRouteProbe(),
+            redial: { [console] id in await console.retryHost(id) })
         Task {
             await ConsoleActivityDriver(
                 activity: activity,
                 console: console,
                 afterSuspend: { await overlayNetworks.suspend() },
-                afterResume: { await overlayNetworks.resumeBrowserSignInAfterActivation() }
+                afterResume: { await overlayNetworks.resumeBrowserSignInAfterActivation() },
+                checkRoutes: { await routeUpgrader.check() }
             ).run()
+        }
+        Task { [console] in
+            for await _ in NetworkPathChanges.stream() {
+                // A change arrives as a burst of path updates; act once.
+                try? await Task.sleep(for: .seconds(1))
+                await console.networkPathDidChange()
+                await routeUpgrader.check()
+            }
         }
         Task { await pushRegistration.refresh() }
         // Existing installs' Notification Keys predate the app-group

@@ -411,17 +411,40 @@ actor HeelerSSHTransport: Transport {
     /// are cancelled, and only the winner authenticates against the Host.
     /// A Jump Host is authenticated on its own route, since nothing past it
     /// is reachable otherwise.
+    ///
+    /// A catalog Host with several routes races them only while no
+    /// connection to it stands: after that every dial takes the route those
+    /// connections hold (ADR 0058).
     static func connect(settings: SSHTransportSettings) async throws -> HeelerSSHTransport {
+        guard let lease = settings.routeLease, settings.routes.count > 1 else {
+            return try await dial(settings, following: nil).connection
+        }
+        return try await lease.leases.connect(
+            to: lease.host,
+            dial: { leased in try await dial(settings, following: leased) },
+            isAlive: { await $0.isConnected },
+            close: { try? await $0.close() })
+    }
+
+    /// One authenticated connection, and the index of the route it reached:
+    /// `leased` alone when the Host's connections hold a route, otherwise
+    /// whichever wins the race.
+    private static func dial(
+        _ settings: SSHTransportSettings, following leased: Int?
+    ) async throws -> (connection: HeelerSSHTransport, route: Int) {
         let gate = HostKeyVerificationGate()
         let connection: SSHConnection
-        let routeID: UUID?
+        let index: Int
         if settings.routes.count == 1, let route = settings.routes.first {
             connection = try await reach(route, settings: settings, gate: gate)
-            routeID = route.id
+            index = 0
+        } else if let leased, settings.routes.indices.contains(leased) {
+            connection = try await follow(leased, settings: settings, gate: gate)
+            index = leased
         } else {
             let won = try await race(settings: settings, gate: gate)
             connection = won.connection
-            routeID = settings.routes[won.index].id
+            index = won.index
         }
         do {
             try await authenticate(
@@ -433,7 +456,62 @@ actor HeelerSSHTransport: Transport {
             try? await connection.close(timeout: .seconds(2))
             throw mapConnect(error)
         }
-        return HeelerSSHTransport(connection: connection, settings: settings, routeID: routeID)
+        let transport = HeelerSSHTransport(
+            connection: connection, settings: settings, routeID: settings.routes[index].id)
+        return (transport, index)
+    }
+
+    /// The one route the Host's connections hold, as far as a verified host
+    /// key. Its failure is reported the way a race reports it, so a changed
+    /// key at an address that may name another machine stays excused and the
+    /// failure keeps the route's name.
+    private static func follow(
+        _ index: Int, settings: SSHTransportSettings, gate: HostKeyVerificationGate
+    ) async throws -> SSHConnection {
+        let route = settings.routes[index]
+        do {
+            return try await reach(route, settings: settings, gate: gate)
+        } catch {
+            let mapped = mapConnect(error)
+            if Task.isCancelled { throw TransportError.cancelled }
+            if case .cancelled = mapped { throw mapped }
+            throw TransportError.noRouteReached([
+                RouteFailure(
+                    route: route.label, mayNameAnotherMachine: route.mayNameAnotherMachine,
+                    error: mapped, routeID: route.id)
+            ])
+        }
+    }
+
+    /// How long a probe of faster routes waits on each of them (ADR 0058).
+    static let routeProbeTimeout: Duration = .seconds(5)
+
+    /// Which of `candidates`, indices into the settings' routes, presents the
+    /// Host's trusted key first; nil when none does. Nothing authenticates
+    /// and no connection is kept: it only says the route would carry a dial
+    /// now. An address another machine answers at fails its key and is not
+    /// reachable.
+    static func reachableRoute(
+        among candidates: [Int], settings: SSHTransportSettings
+    ) async -> Int? {
+        let candidates = candidates.filter(settings.routes.indices.contains)
+        guard !candidates.isEmpty else { return nil }
+        var probe = settings
+        probe.requestTimeout = min(settings.requestTimeout, routeProbeTimeout)
+        let gate = HostKeyVerificationGate()
+        let won = try? await RouteRace.first(
+            count: candidates.count,
+            isDeferred: { _ in false },
+            stagger: .zero,
+            attempt: { [probe] index in
+                try await reach(probe.routes[candidates[index]], settings: probe, gate: gate)
+            },
+            discard: { connection in
+                try? await connection.close(timeout: .seconds(2))
+            })
+        guard let won else { return nil }
+        try? await won.value.close(timeout: .seconds(2))
+        return candidates[won.index]
     }
 
     /// The winning route's index in `settings.routes` and its connection.
@@ -885,7 +963,7 @@ actor HeelerSSHTransport: Transport {
         // itself; every caller, first or later, just awaits it.
         let opening = Task { () throws -> SSHSFTPClient in
             defer { sessionFileClientOpening = nil }
-            let lease = try await channelAdmission.acquire(.ordinarySession)
+            let lease = try await channelAdmission.acquire(.ordinarySession, priority: .interactive)
             let client: SSHSFTPClient
             do {
                 client = try await connection.openSFTP(timeout: requestTimeout)
@@ -1378,7 +1456,8 @@ actor HeelerSSHTransport: Transport {
         _ = try await request(
             method: "agent.focus",
             params: target,
-            decoding: AgentInfoResponse.self)
+            decoding: AgentInfoResponse.self,
+            priority: .interactive)
     }
 
     func renameAgent(_ params: AgentRenameParams) async throws {
@@ -2487,7 +2566,8 @@ actor HeelerSSHTransport: Transport {
         decoding type: R.Type,
         beforeDispatch: (@Sendable () async throws -> Void)? = nil,
         onDispatched: (@Sendable () async -> Void)? = nil,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        priority: SSHChannelAdmission.Priority = .normal
     ) async throws -> R {
         try await withColdStartWake {
             try await self.performRequest(
@@ -2496,7 +2576,8 @@ actor HeelerSSHTransport: Transport {
                 decoding: type,
                 beforeDispatch: beforeDispatch,
                 onDispatched: onDispatched,
-                timeout: timeout)
+                timeout: timeout,
+                priority: priority)
         }
     }
 
@@ -2506,7 +2587,8 @@ actor HeelerSSHTransport: Transport {
         decoding type: R.Type,
         beforeDispatch: (@Sendable () async throws -> Void)? = nil,
         onDispatched: (@Sendable () async -> Void)? = nil,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        priority: SSHChannelAdmission.Priority = .normal
     ) async throws -> R {
         guard connected else {
             throw TransportError.sshUnreachable(
@@ -2523,7 +2605,7 @@ actor HeelerSSHTransport: Transport {
             let socketPath = try await self.resolvedSocketPath()
             if environment.isWindows {
                 try await self.checkWindowsBridge()
-                return try await self.channelAdmission.withChannel(.ordinarySession) {
+                return try await self.channelAdmission.withChannel(.ordinarySession, priority: priority) {
                     let exec: SSHExecChannel
                     do {
                         exec = try await self.connection.openExec(
@@ -2562,7 +2644,7 @@ actor HeelerSSHTransport: Transport {
                     }
                 }
             }
-            return try await self.channelAdmission.withChannel(.ordinaryForwarding) {
+            return try await self.channelAdmission.withChannel(.ordinaryForwarding, priority: priority) {
                 do {
                     return try await self.connection.exchangeStreamLocal(
                         socketPath: socketPath,
@@ -2685,7 +2767,9 @@ actor HeelerSSHTransport: Transport {
         try await withRequestDeadline {
             try await self.environment.value {
                 if self.connection.serverIdentification?.contains("Windows") != true {
-                    let result = try await self.runExec(Self.cLocaleCommand(self.homeCommand))
+                    let result = try await self.runExec(
+                        Self.cLocaleCommand(self.homeCommand),
+                        priority: .interactive)
                     if result.exitStatus == 0,
                         let home = Self.markerValue(
                             in: result.stdout,
@@ -2695,7 +2779,9 @@ actor HeelerSSHTransport: Transport {
                         return .posix(home: home)
                     }
                 }
-                let windows = try await self.runExec(RemoteHostEnvironment.windowsProbe)
+                let windows = try await self.runExec(
+                    RemoteHostEnvironment.windowsProbe,
+                    priority: .interactive)
                 guard windows.exitStatus == 0,
                     let environment = RemoteHostEnvironment.windows(from: windows.stdout)
                 else {
@@ -2870,7 +2956,8 @@ actor HeelerSSHTransport: Transport {
             deadline: chatQueryTimeout,
             remoteSeconds: max(1, chatQueryTimeout.components.seconds - 2),
             timeoutMarkerPrefix: "__HEELER_OC_TIMEOUT_", timedOut: .hostFileTimedOut,
-            lane: chatQueryLane)
+            lane: chatQueryLane,
+            priority: .interactive)
         return try OpenCodeProbe.parse(
             stdout: result.stdout, stderr: result.stderr, exitStatus: result.exitStatus,
             nonce: nonce, query: query)
@@ -2904,7 +2991,8 @@ actor HeelerSSHTransport: Transport {
     /// to drain, its wait counted against its own deadline.
     func runBoundedScript(
         _ script: Data, feature: String, deadline: Duration, remoteSeconds: Int64,
-        timeoutMarkerPrefix: String, timedOut: TransportError, lane: GitExecGate? = nil
+        timeoutMarkerPrefix: String, timedOut: TransportError, lane: GitExecGate? = nil,
+        priority: SSHChannelAdmission.Priority = .normal
     ) async throws -> GitExecResult {
         try await requirePOSIXHost(feature: feature)
         try requireConnected()
@@ -2918,7 +3006,7 @@ actor HeelerSSHTransport: Transport {
             let exchangeTimeout = Duration.seconds(remoteSeconds)
                 + max(requestTimeout, SSHTransportSettings.defaultRequestTimeout)
             return try await Self.runInLane(deadline: deadline, lane: lane) {
-                try await self.channelAdmission.withChannel(.ordinarySession) {
+                try await self.channelAdmission.withChannel(.ordinarySession, priority: priority) {
                     try Task.checkCancellation()
                     try await self.requireConnected()
                     // Awaiting an unstructured task does not forward cancellation.
@@ -3000,8 +3088,12 @@ actor HeelerSSHTransport: Transport {
         return input
     }
 
-    private func runExec(_ command: String, timeout: Duration? = nil) async throws -> SSHExecResult {
-        try await channelAdmission.withChannel(.ordinarySession) {
+    private func runExec(
+        _ command: String,
+        timeout: Duration? = nil,
+        priority: SSHChannelAdmission.Priority = .normal
+    ) async throws -> SSHExecResult {
+        try await channelAdmission.withChannel(.ordinarySession, priority: priority) {
             do {
                 return try await self.connection.execute(
                     command,
@@ -4029,7 +4121,8 @@ extension HeelerSSHTransport: HerdrCoreHostConnection {
         let result = try await runBoundedScript(
             HostProcessReader.script(request, nonce: nonce), feature: String(localized: "Agent permission modes"),
             deadline: .seconds(12), remoteSeconds: 8,
-            timeoutMarkerPrefix: "__HEELER_PROCESS_READ_TIMEOUT_", timedOut: .hostFileTimedOut)
+            timeoutMarkerPrefix: "__HEELER_PROCESS_READ_TIMEOUT_", timedOut: .hostFileTimedOut,
+            priority: .interactive)
         guard result.exitStatus == 0 else { return [:] }
         return try HostProcessReader.parse(stdout: result.stdout, nonce: nonce, request: request)
     }
@@ -4038,7 +4131,8 @@ extension HeelerSSHTransport: HerdrCoreHostConnection {
     func runHostProcessRead(_ script: Data) async throws -> GitExecResult {
         try await runBoundedScript(
             script, feature: String(localized: "herdr-core Hosts"), deadline: .seconds(12), remoteSeconds: 8,
-            timeoutMarkerPrefix: "__HEELER_PROCESS_READ_TIMEOUT_", timedOut: .timedOut)
+            timeoutMarkerPrefix: "__HEELER_PROCESS_READ_TIMEOUT_", timedOut: .timedOut,
+            priority: .interactive)
     }
 
     /// One bounded exec, cut off on the Host if a startup file waits for input
@@ -4062,14 +4156,59 @@ extension HeelerSSHTransport: HerdrCoreHostConnection {
             throw TransportError.sshUnreachable(detail: String(localized: "The SSH connection is closed."))
         }
         return try await channelAdmission.admitCoreLink {
-            do {
-                return try await self.connection.openStreamLocal(
-                    socketPath: socketPath, timeout: self.requestTimeout)
-            } catch SSHError.streamLocalOpenFailed {
-                throw TransportError.streamLocalOpenFailed(path: socketPath)
-            } catch {
-                throw await self.mapOperationError(error)
-            }
+            try await self.openForwardedSocket(socketPath)
         }
+    }
+
+    private func openForwardedSocket(_ socketPath: String) async throws -> any HeelerSSHAPIChannel {
+        do {
+            return try await connection.openStreamLocal(socketPath: socketPath, timeout: requestTimeout)
+        } catch SSHError.streamLocalOpenFailed {
+            throw TransportError.streamLocalOpenFailed(path: socketPath)
+        } catch {
+            throw await mapOperationError(error)
+        }
+    }
+}
+
+// MARK: - What a Rex Host uses of this connection
+/// Chat's reads are the Chat Host files above, and a staging is the one
+/// under Attachment staging, as on every other Server Kind.
+extension HeelerSSHTransport: RexHostConnection {
+    /// The control link holds the events slot, as a core link does.
+    func openRexControlChannel(socketPath: String) async throws -> any HeelerSSHAPIChannel {
+        try await openCoreLinkChannel(socketPath: socketPath)
+    }
+
+    func openRexDataChannel(socketPath: String) async throws -> any HeelerSSHAPIChannel {
+        guard connected else {
+            throw TransportError.sshUnreachable(detail: String(localized: "The SSH connection is closed."))
+        }
+        return try await channelAdmission.admitAttachLink {
+            try await self.openForwardedSocket(socketPath)
+        }
+    }
+
+    /// One bounded exec that tests a file and lists sockets.
+    func runRexSocketCheck(_ script: Data) async throws -> GitExecResult {
+        try await runBoundedScript(
+            script, feature: String(localized: "Rex Hosts"), deadline: .seconds(12), remoteSeconds: 8,
+            timeoutMarkerPrefix: "__HEELER_REX_SOCKET_CHECK_TIMEOUT_", timedOut: .timedOut)
+    }
+
+    /// The folder is made only as the last part of a directory that is there:
+    /// an Agent's own directory is the program's to make. The file goes as a
+    /// Host Helper's copy of it does, a 0600 temporary file renamed into place.
+    func placeHeelersExtension(_ contents: Data, inFolder folder: String) async throws {
+        guard RemoteFilePath.isAcceptable(folder), folder.hasSuffix("/\(HostHelperScript.extensionFolderName)") else {
+            throw TransportError.invalidDirectoryPath(path: folder)
+        }
+        let timeout = requestTimeout
+        try await withHostFileClient(path: folder) { client in
+            guard try await client.fileStatus(at: folder, timeout: timeout) == nil else { return }
+            try await client.createDirectory(at: folder, permissions: 0o755, timeout: timeout)
+        }
+        try await replaceHostHelperFile(
+            contents, at: "\(folder)/\(HostHelperScript.extensionFileName)", privateDirectory: nil)
     }
 }
