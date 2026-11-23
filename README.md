@@ -4,7 +4,7 @@
 
 # Heeler
 
-<a href="https://apps.apple.com/us/app/heeler-for-herdr/id6797263135"><img src="https://toolbox.marketingtools.apple.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download on the App Store" height="40" /></a>
+<a href="https://apps.apple.com/us/app/id6797263135"><img src="https://toolbox.marketingtools.apple.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download on the App Store" height="40" /></a>
 <a href="https://testflight.apple.com/join/aXSxRn4r"><img src="docs/images/testflight-badge.svg" alt="Available on TestFlight" height="40" /></a>
 
 **The iPhone and iPad console for the coding agents running on your own machines.**
@@ -16,7 +16,7 @@ Works with [Herdr TUI](https://herdr.dev), the Herdr desktop app (herdr-core), a
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-6F42C1?style=flat-square)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white&style=flat-square)](https://www.swift.org)
 [![iOS](https://img.shields.io/badge/iOS-18%2B-000000?logo=apple&logoColor=white&style=flat-square)](https://developer.apple.com/ios/)
-[![App Store](https://img.shields.io/badge/App_Store-available-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135)
+[![App Store](https://img.shields.io/badge/App_Store-available-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://apps.apple.com/us/app/id6797263135)
 
 <a href="https://trendshift.io/repositories/151670?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-151670" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/151670" alt="ZingerLittleBee%2FHeeler | Trendshift" width="250" height="55"/></a>
 
@@ -65,12 +65,12 @@ Heeler is an independent, open-source agent console and **herdr mobile client** 
 - **Notifications and Live Activities**: an end-to-end encrypted push when an Agent goes Blocked or Done, and your Agents on the Lock Screen and Dynamic Island. The relay cannot read the content. [Privacy](PRIVACY.md)
 - **Usage**: Claude Code and Codex Usage Limits with their reset times, up to 30 days of Token Usage with its estimated API cost, and Home Screen and Lock Screen widgets. [Usage guide](https://docs.heeler.bybee.dev/usage)
 - **Composer**: draft with the full iOS keyboard or by voice, then Send once. The tools keyboard adds Agent control keys, Skills, and Snippets, and you can attach a photo or a file up to 64 MiB. [Voice Input guide](https://docs.heeler.bybee.dev/voice-input)
-- **Reach from anywhere**: Tailscale, ZeroTier, and EasyTier are built into the app, so the phone needs no VPN app. A Jump Host covers machines you cannot route to, and a Host can have several routes. [Overlay networks](https://docs.heeler.bybee.dev/overlay-networks) · [Jump Host](https://docs.heeler.bybee.dev/vps-jump-host-setup) · [Routes](https://docs.heeler.bybee.dev/host-routes)
+- **Reach from anywhere**: Tailscale, ZeroTier, EasyTier, and tailcat are built into the app, so the phone needs no VPN app. A Jump Host covers machines you cannot route to, and a Host can have several routes. [Overlay networks](https://docs.heeler.bybee.dev/overlay-networks) · [Jump Host](https://docs.heeler.bybee.dev/vps-jump-host-setup) · [Routes](https://docs.heeler.bybee.dev/host-routes)
 - **Also**: QR pairing, Worktrees, a Changes view of staged and unstaged files, 30 themes, and iPad with Magic Keyboard shortcuts, multiwindow, and drag and drop.
 
 ## Installation
 
-Install Heeler from the [App Store](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135) or [TestFlight](https://testflight.apple.com/join/aXSxRn4r). The machine needs SSH turned on and one of these backends:
+Install Heeler from the [App Store](https://apps.apple.com/us/app/id6797263135) or [TestFlight](https://testflight.apple.com/join/aXSxRn4r). The machine needs SSH turned on and one of these backends:
 
 | Backend | Runs on | Guide |
 | --- | --- | --- |
@@ -95,7 +95,7 @@ Scan the code it shows and the machine is added as a Host, with its addresses, h
 
 **Or enter the address.** This works for every backend. In **Hosts**, tap **+**, enter the address and your SSH user, and Heeler lists what the machine runs: Herdr TUI, herdr-core, each tmux server, and Rex. One Host can carry several of them. [Connect herdr-core](https://docs.heeler.bybee.dev/herdr-core) · [Connect tmux](https://docs.heeler.bybee.dev/tmux) · [Connect Rex](https://docs.heeler.bybee.dev/rex) · [Windows setup](https://docs.heeler.bybee.dev/windows-setup)
 
-**Away from home.** Reach the machine over a built-in [overlay network](https://docs.heeler.bybee.dev/overlay-networks) ([Tailscale](https://docs.heeler.bybee.dev/tailscale), [ZeroTier](https://docs.heeler.bybee.dev/zerotier), [EasyTier](https://docs.heeler.bybee.dev/easytier)), a [Jump Host](https://docs.heeler.bybee.dev/vps-jump-host-setup), or [Cloudflare Tunnel](https://docs.heeler.bybee.dev/cloudflare-tunnel), and give the Host [several routes](https://docs.heeler.bybee.dev/host-routes) so it works at home and away.
+**Away from home.** Reach the machine over a built-in [overlay network](https://docs.heeler.bybee.dev/overlay-networks) ([Tailscale](https://docs.heeler.bybee.dev/tailscale), [ZeroTier](https://docs.heeler.bybee.dev/zerotier), [EasyTier](https://docs.heeler.bybee.dev/easytier), [tailcat](https://docs.heeler.bybee.dev/tailcat)), a [Jump Host](https://docs.heeler.bybee.dev/vps-jump-host-setup), or [Cloudflare Tunnel](https://docs.heeler.bybee.dev/cloudflare-tunnel), and give the Host [several routes](https://docs.heeler.bybee.dev/host-routes) so it works at home and away.
 
 ## How it connects
 
@@ -124,7 +124,7 @@ Heeler is SwiftUI on iOS 18+, with SSH from the repository-local `Packages/Heele
 
 ## Status
 
-Released on the [App Store](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135).
+Released on the [App Store](https://apps.apple.com/us/app/id6797263135).
 It is not yet available in every country or region; where it is missing, the
 [TestFlight](https://testflight.apple.com/join/aXSxRn4r) build stays available.
 Built for personal use first and shaped by daily driving, so expect rough edges and

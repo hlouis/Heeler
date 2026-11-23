@@ -162,12 +162,14 @@ private struct ConsoleHostIssueCountLine: View {
     }
 }
 
-/// The Hosts behind the flat lists' summary, in a sheet. A Host that cannot
-/// connect pushes the connection detail its own row would open; any other
-/// navigable condition opens the Host in the Hosts tab.
+/// The Hosts behind the flat lists' summary, in a sheet, each once whatever
+/// Servers it has on (ADR 0058). A Host that cannot connect pushes the
+/// connection detail its own row would open; any other navigable condition
+/// opens the Server it is of in the Hosts tab.
 struct ConsoleHostIssuesSheet<Detail: View & SendableMetatype>: View {
     let issues: [ConsoleHostStatusPresentation]
-    /// Hosts the connection detail explains, which push it.
+    /// Hosts the connection detail explains, which push it, by the record
+    /// their conditions are keyed by.
     let explained: Set<Host.ID>
     /// The presenting Console's: inside the sheet, the size class describes
     /// the sheet, not the screen.
@@ -185,7 +187,7 @@ struct ConsoleHostIssuesSheet<Detail: View & SendableMetatype>: View {
                     if explained.contains(issue.hostID) {
                         NavigationLink(value: issue.hostID) { row(issue) }
                     } else if issue.navigates {
-                        Button { onOpenHost(issue.hostID) } label: {
+                        Button { onOpenHost(issue.serverID) } label: {
                             HStack {
                                 row(issue)
                                 // Drawn as the list draws the pushing rows' own,
@@ -335,15 +337,16 @@ extension EnvironmentValues {
     @Entry var consoleListShowsDisclosure = true
 }
 
-/// Bottom-trailing floating Host status tile for the Agents list's `.flat` and
-/// `.byWorkspace` presentations: expands briefly when a Host enters an issue
-/// state (or escalates to a failure), then settles into a compact squircle
-/// tile with a linear bottom status bar so it never collides with circular
-/// Agent Status Rings or displaces list rows.
+/// Bottom-trailing floating Host status tile for the Agents and Terminals
+/// lists: expands briefly when a Host enters an issue state (or escalates to a
+/// failure), then settles into a compact squircle tile with a linear bottom
+/// status bar so it never collides with circular Agent Status Rings or
+/// displaces list rows.
 struct ConsoleHostIssueCornerBadge: View {
     let issues: [ConsoleHostStatusPresentation]
     let onOpenHost: (Host.ID) -> Void
     let onShowAll: () -> Void
+    var accessibilityID: String
     var autoCollapseDelay: Duration = .seconds(3)
     var sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
 
@@ -360,6 +363,7 @@ struct ConsoleHostIssueCornerBadge: View {
         issues: [ConsoleHostStatusPresentation],
         onOpenHost: @escaping (Host.ID) -> Void,
         onShowAll: @escaping () -> Void,
+        accessibilityID: String = "agents.hostIssues.badge",
         autoCollapseDelay: Duration = .seconds(3),
         sleep: @escaping @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
@@ -368,6 +372,7 @@ struct ConsoleHostIssueCornerBadge: View {
         self.issues = issues
         self.onOpenHost = onOpenHost
         self.onShowAll = onShowAll
+        self.accessibilityID = accessibilityID
         self.autoCollapseDelay = autoCollapseDelay
         self.sleep = sleep
         _isExpanded = State(initialValue: !issues.isEmpty)
@@ -467,7 +472,7 @@ struct ConsoleHostIssueCornerBadge: View {
         .accessibilityLabel(current.accessibilityLabel)
         .accessibilityHint(current.accessibilityHint ?? "")
         .accessibilityAddTraits(.isButton)
-        .accessibilityIdentifier("agents.hostIssues.badge")
+        .accessibilityIdentifier(accessibilityID)
     }
 
     private func expandedLabel(for current: ConsoleHostIssueCornerPresentation) -> some View {

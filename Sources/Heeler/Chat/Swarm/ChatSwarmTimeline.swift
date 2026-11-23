@@ -52,34 +52,161 @@ actor ChatSwarmMarkdownParser {
     }
 }
 
-// MARK: - Board Row & Model
+// MARK: - Board Filter, Row & Model
+
+enum ChatSwarmBoardFilter: Equatable, Hashable, Sendable {
+    case all
+    case done
+    case stall
+    case channel(String)
+    case author(String)
+
+    func matches(_ message: AgySwarmSnapshot.BoardMessage) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .done:
+            return message.isMarkedDone
+        case .stall:
+            return message.isMarkedStall
+        case .channel(let name):
+            return message.channel == name
+        case .author(let name):
+            return message.agent.caseInsensitiveCompare(name) == .orderedSame
+        }
+    }
+
+    var scopeKey: String {
+        switch self {
+        case .all: "*"
+        case .done: "done"
+        case .stall: "stall"
+        case .channel(let name): "ch:\(name)"
+        case .author(let name): "au:\(name.lowercased())"
+        }
+    }
+
+    struct Option: Identifiable, Equatable, Sendable {
+        enum Kind: Equatable, Sendable {
+            case neutral
+            case done
+            case stall
+            case archivedChannel
+        }
+
+        let filter: ChatSwarmBoardFilter
+        let label: String
+        let count: Int?
+        let kind: Kind
+
+        var id: ChatSwarmBoardFilter { filter }
+    }
+
+    static func options(in swarm: AgySwarmSnapshot) -> [Option] {
+        var result: [Option] = [
+            Option(filter: .all, label: String(localized: "All"), count: nil, kind: .neutral),
+        ]
+
+        if !swarm.channels.isEmpty {
+            result.append(
+                Option(
+                    filter: .channel(AgySwarmParser.mainChannel),
+                    label: "#\(AgySwarmParser.mainChannel)",
+                    count: nil,
+                    kind: .neutral))
+            for channel in swarm.channels {
+                result.append(
+                    Option(
+                        filter: .channel(channel.name),
+                        label: "#\(channel.name)",
+                        count: nil,
+                        kind: channel.isArchived ? .archivedChannel : .neutral))
+            }
+        }
+
+        let doneCount = swarm.boardPosts.count { $0.isMarkedDone }
+        if doneCount > 0 {
+            result.append(
+                Option(
+                    filter: .done,
+                    label: String(localized: "Done"),
+                    count: doneCount,
+                    kind: .done))
+        }
+
+        let stallCount = swarm.boardPosts.count { $0.isMarkedStall }
+        if stallCount > 0 {
+            result.append(
+                Option(
+                    filter: .stall,
+                    label: String(localized: "Stall"),
+                    count: stallCount,
+                    kind: .stall))
+        }
+
+        var postAuthors: Set<String> = []
+        var authorAppearance: [String] = []
+        for post in swarm.boardPosts where !post.agent.isEmpty {
+            let key = post.agent.lowercased()
+            if postAuthors.insert(key).inserted {
+                authorAppearance.append(post.agent)
+            }
+        }
+        if authorAppearance.count >= 2 {
+            var added: Set<String> = []
+            var orderedAuthors: [String] = []
+            for member in swarm.members {
+                let key = member.name.lowercased()
+                if postAuthors.contains(key), added.insert(key).inserted {
+                    orderedAuthors.append(member.name)
+                }
+            }
+            for author in authorAppearance {
+                let key = author.lowercased()
+                if added.insert(key).inserted {
+                    orderedAuthors.append(author)
+                }
+            }
+            for author in orderedAuthors {
+                result.append(
+                    Option(
+                        filter: .author(author),
+                        label: "@\(author)",
+                        count: nil,
+                        kind: .neutral))
+            }
+        }
+
+        return result.count > 1 ? result : []
+    }
+}
 
 struct ChatSwarmBoardRow: Sendable, Equatable {
     let message: AgySwarmSnapshot.BoardMessage
     let citedSeqs: [Int]
-    let isCollapsedBrief: Bool
-    let isExpandedBrief: Bool
+    /// Whether this row truncates in the directory and advertises opening the
+    /// dedicated Post Detail reader.
+    let opensDetail: Bool
     let isHighlighted: Bool
-    let blocks: [ChatMarkdownBlock]?
+    /// The feed's first post, which takes top rounded corners and no divider.
+    let isFirst: Bool
+    /// The feed's last post, which takes bottom rounded corners.
+    let isLast: Bool
 
     var seq: Int { message.seq }
 
+    /// Compact inset-grouped directory row: heading over either a short post's
+    /// full text or a 2-line preview with trailing line-count badge.
     var extent: ChatRowExtent {
-        let citeExtra: CGFloat = citedSeqs.isEmpty ? 0 : 30
-        if isCollapsedBrief {
-            return ChatRowExtent(
-                textBytes: min(message.text.utf8.count, 260),
-                blocks: 2,
-                chrome: 86 + citeExtra,
-                inset: 58)
-        }
-        let blockCount = max(1, blocks?.count ?? (1 + message.text.utf8.count / 180))
-        let expandExtra: CGFloat = message.shouldCollapseBrief ? 24 : 0
+        let previewBytes =
+            opensDetail
+            ? min(message.singleLinePreview.utf8.count, 120)
+            : min(message.text.utf8.count, 130)
         return ChatRowExtent(
-            textBytes: message.text.utf8.count,
-            blocks: blockCount,
-            chrome: 62 + citeExtra + expandExtra,
-            inset: 58)
+            textBytes: previewBytes,
+            blocks: 1,
+            chrome: 44,
+            inset: opensDetail ? 112 : 60)
     }
 }
 
@@ -91,11 +218,10 @@ final class ChatSwarmBoardModel {
     private struct RowSource: Equatable {
         var message: AgySwarmSnapshot.BoardMessage
         var citedSeqs: [Int]
-        var isCollapsedBrief: Bool
-        var isExpandedBrief: Bool
+        var opensDetail: Bool
         var isHighlighted: Bool
-        var hasBlocks: Bool
-        var topSpacing: CGFloat
+        var isFirst: Bool
+        var isLast: Bool
     }
 
     private struct RowMemo {
@@ -117,9 +243,9 @@ final class ChatSwarmBoardModel {
     @ObservationIgnored private var scopeGeneration = 0
     @ObservationIgnored private var lastScopeKey: String?
 
-    /// Pre-parses non-collapsed board posts off the main actor when `AgentChatStore`
-    /// receives new Swarm board messages, starting from the newest posts so the
-    /// bottom of the Board is ready before the sheet even opens.
+    /// Pre-parses Markdown off the main actor for the newest few board posts
+    /// so opening recent posts in the Post Detail reader is instantaneous
+    /// without eagerly parsing dozens of offscreen posts.
     func warm(swarm: AgySwarmSnapshot?) {
         guard let swarm else {
             reset()
@@ -131,28 +257,28 @@ final class ChatSwarmBoardModel {
         }
         guard warmedBoardRevision != swarm.boardRevision else { return }
         warmedBoardRevision = swarm.boardRevision
-        enqueueMissingBlocks(posts: swarm.boardPosts, expandedBriefs: [])
+        enqueueMissingBlocks(posts: Array(swarm.boardPosts.suffix(4)))
     }
 
     func ensureBlocks(
         swarmID: String,
-        posts: [AgySwarmSnapshot.BoardMessage],
-        expandedBriefs: Set<Int>
+        posts: [AgySwarmSnapshot.BoardMessage]
     ) {
         if trackedSwarmID != swarmID {
             reset()
             trackedSwarmID = swarmID
         }
-        enqueueMissingBlocks(posts: posts, expandedBriefs: expandedBriefs)
+        enqueueMissingBlocks(posts: posts)
     }
 
     func parsedBlocks(for seq: Int, text: String) -> [ChatMarkdownBlock]? {
+        let _ = blocksRevision
         guard let entry = blocksBySeq[seq], entry.text == text else { return nil }
         return entry.blocks
     }
 
-    func generation(for swarmID: String, channel: String?) -> Int {
-        let key = "\(swarmID)|\(channel ?? "*")"
+    func generation(for swarmID: String, filter: ChatSwarmBoardFilter) -> Int {
+        let key = "\(swarmID)|\(filter.scopeKey)"
         if lastScopeKey != key {
             lastScopeKey = key
             scopeGeneration &+= 1
@@ -162,44 +288,46 @@ final class ChatSwarmBoardModel {
 
     func buildState(
         swarmID: String,
-        channel: String?,
+        filter: ChatSwarmBoardFilter,
         posts: [AgySwarmSnapshot.BoardMessage],
         knownSeqs: Set<Int>,
-        expandedBriefs: Set<Int>,
         highlightedSeq: Int?
     ) -> ChatSwarmListState<Int, ChatSwarmBoardRow> {
-        let _ = blocksRevision
         if trackedSwarmID != swarmID {
             reset()
             trackedSwarmID = swarmID
         }
-        let gen = generation(for: swarmID, channel: channel)
-        var items: [ChatSwarmListItem<Int, ChatSwarmBoardRow>] = []
-        items.reserveCapacity(posts.count)
+        let gen = generation(for: swarmID, filter: filter)
+        var deduped: [AgySwarmSnapshot.BoardMessage] = []
+        deduped.reserveCapacity(posts.count)
         var seen: Set<Int> = []
+        for post in posts where seen.insert(post.seq).inserted {
+            deduped.append(post)
+        }
 
-        for post in posts {
-            guard seen.insert(post.seq).inserted else { continue }
-            let isExpanded = expandedBriefs.contains(post.seq)
-            let isCollapsed = post.shouldCollapseBrief && !isExpanded
-            let blocks = isCollapsed ? nil : parsedBlocks(for: post.seq, text: post.text)
+        var items: [ChatSwarmListItem<Int, ChatSwarmBoardRow>] = []
+        items.reserveCapacity(deduped.count)
+        let lastIndex = deduped.count - 1
+
+        for (index, post) in deduped.enumerated() {
             let cited = post.citedSeqs(in: knownSeqs)
-            let topSpacing: CGFloat = items.isEmpty ? 0 : 10
+            let opensDetail = post.isLongPost || post.isBrief || !cited.isEmpty
+            let isFirst = index == 0
+            let isLast = index == lastIndex
             let row = ChatSwarmBoardRow(
                 message: post,
                 citedSeqs: cited,
-                isCollapsedBrief: isCollapsed,
-                isExpandedBrief: isExpanded,
+                opensDetail: opensDetail,
                 isHighlighted: highlightedSeq == post.seq,
-                blocks: blocks)
+                isFirst: isFirst,
+                isLast: isLast)
             let source = RowSource(
                 message: post,
                 citedSeqs: cited,
-                isCollapsedBrief: isCollapsed,
-                isExpandedBrief: isExpanded,
+                opensDetail: opensDetail,
                 isHighlighted: highlightedSeq == post.seq,
-                hasBlocks: blocks != nil,
-                topSpacing: topSpacing)
+                isFirst: isFirst,
+                isLast: isLast)
             let revision: Int
             if let old = rowMemos[post.seq], old.source == source {
                 revision = old.revision
@@ -213,7 +341,7 @@ final class ChatSwarmBoardModel {
                     id: post.seq,
                     payload: row,
                     revision: revision,
-                    topSpacing: topSpacing,
+                    topSpacing: 0,
                     seed: .assistant,
                     extent: row.extent,
                     copyText: post.text.isEmpty ? nil : post.text))
@@ -249,16 +377,10 @@ final class ChatSwarmBoardModel {
         parser = ChatSwarmMarkdownParser()
     }
 
-    private func enqueueMissingBlocks(
-        posts: [AgySwarmSnapshot.BoardMessage],
-        expandedBriefs: Set<Int>
-    ) {
+    private func enqueueMissingBlocks(posts: [AgySwarmSnapshot.BoardMessage]) {
         var missing: [(seq: Int, key: String, source: String)] = []
-        // Reverse order so the newest visible posts at the bottom of the Board
-        // parse and render first.
-        for post in posts.reversed() {
-            let needsMarkdown = !post.shouldCollapseBrief || expandedBriefs.contains(post.seq)
-            guard needsMarkdown else { continue }
+        var seen: Set<Int> = []
+        for post in posts where seen.insert(post.seq).inserted {
             if let existing = blocksBySeq[post.seq], existing.text == post.text {
                 continue
             }
@@ -314,7 +436,7 @@ enum ChatSwarmWorkerRow: Sendable, Equatable {
     case loading
     case failure(String)
     case empty
-    case entry(ChatEntry, isExpanded: Bool, blocks: [ChatMarkdownBlock]?)
+    case entry(ChatEntry, isCollapsible: Bool, lineCount: Int, isExpanded: Bool, blocks: [ChatMarkdownBlock]?)
 }
 
 @MainActor
@@ -338,6 +460,18 @@ final class ChatSwarmWorkerModel {
     @ObservationIgnored private(set) var measuredHeights: [ChatSwarmWorkerItemID: ChatMeasuredHeight] = [:]
     @ObservationIgnored private var generation = 0
 
+    static func collapseInfo(for text: String) -> (isCollapsible: Bool, lineCount: Int) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return (false, 0) }
+        let lines = AgySwarmSnapshot.BoardMessage.countLines(in: trimmed)
+        let collapsible = lines >= 6 || trimmed.utf8.count > 360 || trimmed.contains("```")
+        return (collapsible, lines)
+    }
+
+    func settled() async {
+        await parseTask?.value
+    }
+
     func ensureBlocks(
         memberName: String,
         assignment: AgySwarmSnapshot.BoardMessage?,
@@ -352,6 +486,8 @@ final class ChatSwarmWorkerModel {
         for entry in entries.reversed() {
             switch entry.content {
             case .assistant(let msg):
+                let collapse = Self.collapseInfo(for: msg.text)
+                guard !collapse.isCollapsible || expandedEntries.contains(entry.id) else { continue }
                 let key = "entry:\(entry.id.rawValue)"
                 if blocksByKey[key]?.text != msg.text {
                     missing.append((key: key, source: msg.text))
@@ -462,9 +598,9 @@ final class ChatSwarmWorkerModel {
                 ? ChatRowExtent(
                     textBytes: assignment.text.utf8.count,
                     blocks: max(1, blocks?.count ?? 2),
-                    chrome: 56,
-                    inset: 56)
-                : ChatRowExtent(textBytes: min(assignment.text.utf8.count, 180), blocks: 1, chrome: 56, inset: 56)
+                    chrome: 72,
+                    inset: 60)
+                : ChatRowExtent(textBytes: min(assignment.text.utf8.count, 140), blocks: 1, chrome: 60, inset: 88)
             append(
                 id: .assignment,
                 payload: .assignment(post: assignment, isExpanded: isAssignmentExpanded, blocks: blocks),
@@ -485,6 +621,9 @@ final class ChatSwarmWorkerModel {
                 extent: nil,
                 copyText: failureMessage)
         } else if let entries, !entries.isEmpty {
+            // A run of tool calls reads as one list, so its rows stand
+            // closer than a row does to prose.
+            var followsTool = false
             for (idx, entry) in entries.enumerated() {
                 guard Self.rendersEntry(entry) else { continue }
                 let isExpanded = expandedEntries.contains(entry.id)
@@ -492,22 +631,51 @@ final class ChatSwarmWorkerModel {
                 let seed: ChatRowSeed
                 let extent: ChatRowExtent?
                 let copyText: String?
+                var isCollapsible = false
+                var lineCount = 0
 
                 switch entry.content {
                 case .user(let msg):
+                    let collapse = Self.collapseInfo(for: msg.displayText)
+                    isCollapsible = collapse.isCollapsible
+                    lineCount = collapse.lineCount
                     blocks = nil
                     seed = .user
-                    extent = ChatRowExtent(textBytes: msg.displayText.utf8.count, blocks: 1, chrome: 20, inset: 64)
+                    if isCollapsible, !isExpanded {
+                        extent = ChatRowExtent(
+                            textBytes: min(msg.displayText.utf8.count, 160),
+                            blocks: 1,
+                            chrome: 46,
+                            inset: 64)
+                    } else {
+                        extent = ChatRowExtent(
+                            textBytes: msg.displayText.utf8.count,
+                            blocks: 1,
+                            chrome: isCollapsible ? 42 : 20,
+                            inset: 64)
+                    }
                     copyText = msg.displayText
                 case .assistant(let msg):
+                    let collapse = Self.collapseInfo(for: msg.text)
+                    isCollapsible = collapse.isCollapsible
+                    lineCount = collapse.lineCount
                     let key = "entry:\(entry.id.rawValue)"
-                    blocks = self.blocks(forKey: key, text: msg.text)
                     seed = .assistant
-                    extent = ChatRowExtent(
-                        textBytes: msg.text.utf8.count,
-                        blocks: max(1, blocks?.count ?? (1 + msg.text.utf8.count / 180)),
-                        chrome: 28,
-                        inset: 56)
+                    if isCollapsible, !isExpanded {
+                        blocks = nil
+                        extent = ChatRowExtent(
+                            textBytes: min(msg.text.utf8.count, 180),
+                            blocks: 1,
+                            chrome: 48,
+                            inset: 56)
+                    } else {
+                        blocks = self.blocks(forKey: key, text: msg.text)
+                        extent = ChatRowExtent(
+                            textBytes: msg.text.utf8.count,
+                            blocks: max(1, blocks?.count ?? (1 + msg.text.utf8.count / 180)),
+                            chrome: isCollapsible ? 48 : 12,
+                            inset: isCollapsible ? 56 : 32)
+                    }
                     copyText = msg.text
                 case .reasoning(let reasoning):
                     let key = "reasoning:\(entry.id.rawValue)"
@@ -518,8 +686,8 @@ final class ChatSwarmWorkerModel {
                         ? ChatRowExtent(
                             textBytes: reasoning.text.utf8.count,
                             blocks: max(1, blocks?.count ?? 2),
-                            chrome: 44,
-                            inset: 54)
+                            chrome: 46,
+                            inset: 32)
                         : nil
                     copyText = reasoning.text
                 case .tool(let tool):
@@ -543,13 +711,20 @@ final class ChatSwarmWorkerModel {
                     continue
                 }
 
+                let isTool = seed == .tool
                 append(
                     id: .entry(entry.id),
-                    payload: .entry(entry, isExpanded: isExpanded, blocks: blocks),
-                    spacing: idx == 0 ? 14 : 10,
+                    payload: .entry(
+                        entry,
+                        isCollapsible: isCollapsible,
+                        lineCount: lineCount,
+                        isExpanded: isExpanded,
+                        blocks: blocks),
+                    spacing: idx == 0 ? 14 : (isTool && followsTool ? 6 : 10),
                     seed: seed,
                     extent: extent,
                     copyText: copyText?.isEmpty == true ? nil : copyText)
+                followsTool = isTool
             }
         } else {
             append(id: .statusNotice, payload: .empty, spacing: 14, seed: .assistant, extent: nil, copyText: nil)

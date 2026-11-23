@@ -7,9 +7,9 @@ assets-only Cloudflare Worker, the same way as `landing/`.
 
 It is self-contained: nothing outside this directory imports from it, and it
 imports nothing from `landing/` (the fonts and logo are copies).
-`.github/workflows/docs-site.yml` runs for `docs-site/**`, `docs/guides/**`,
-and its own file. The app workflows (`ci.yml`, `ci-node.yml`) include none of
-these paths, so a docs change never starts the iOS test lanes; for the same
+`.github/workflows/cloudflare.yml` runs for `docs-site/**`, `docs/guides/**`,
+`landing/**`, and its own file. `ci.yml` skips the iOS build when none of the
+iOS paths changed, so a docs change never starts an Xcode build; for the same
 reason the docs site has no `make` targets, as `ci.yml` runs for any change to
 the root `Makefile`.
 
@@ -187,7 +187,7 @@ repository root.
 ### Published guides
 
 `pairing`, `overlay-networks`, `tailscale`, `zerotier`, `easytier`,
-`cloudflare-tunnel`, `vps-jump-host-setup`, `vps-jump-host`, `herdr-core`,
+`tailcat`, `cloudflare-tunnel`, `vps-jump-host-setup`, `vps-jump-host`, `herdr-core`,
 `tmux`, `rex`, `host-routes`, `windows-setup`, `selinux`, `chat`,
 `chat-troubleshooting`, `voice-input`, and `usage`.
 Maintainer documents in `docs/guides/` (`releasing.md`,

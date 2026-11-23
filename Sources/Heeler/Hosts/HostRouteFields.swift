@@ -124,6 +124,13 @@ struct HostRouteFields: View {
                 }
             }
             .accessibilityHint("Lists the peers of \(network.displayName)")
+        } else if let network = selectedOverlayNetwork, network.kind == .tailcat,
+            !route.dialsTailcatServer(of: network)
+        {
+            // A typed address the tunnel cannot reach: offer the one it can.
+            Button("Use the Tunnel's Address") {
+                route.useTailcatServer(of: network)
+            }
         }
     }
 
@@ -152,6 +159,9 @@ struct HostRouteFields: View {
                     Text("Unavailable network").tag(route.overlayNetworkID)
                 }
             }
+            .onChange(of: route.overlayNetworkID) { _, networkID in
+                route.followTailcatServer(of: networkID.flatMap { overlayNetworks?.network(id: $0) })
+            }
             overlayPeerChooser
         } header: {
             Text("Network")
@@ -167,7 +177,12 @@ struct HostRouteFields: View {
         guard route.overlayNetworkID != nil else {
             return hasNetworks
                 ? String(localized: "Direct uses this device's own network connection.")
-                : String(localized: "Direct uses this device's own network connection. Add Tailscale, ZeroTier, or EasyTier networks in Settings › Overlay Networks.")
+                : String(localized: "Direct uses this device's own network connection. Add Tailscale, ZeroTier, EasyTier, or tailcat networks in Settings › Overlay Networks.")
+        }
+        if let serverName = selectedOverlayNetwork?.tailcatServerName {
+            return route.usesJumpHost
+                ? String(localized: "A tailcat tunnel reaches one machine, the one running tailcat serve, as \(serverName). The Jump Host's port must be one that tailcat serve exposes.")
+                : String(localized: "A tailcat tunnel reaches one machine, the one running tailcat serve, as \(serverName). This Host's port must be one that tailcat serve exposes.")
         }
         // Whole sentences per first hop: the Jump Host or this Host.
         let listsNoPeers = selectedOverlayNetwork.map { !OverlayPeerList.offersPeers($0.kind) } ?? false
@@ -373,9 +388,10 @@ struct HostRouteRow: View {
             kind: HostRouteKind(
                 usesOverlay: route.overlayNetworkID != nil, usesJumpHost: route.usesJumpHost)
         ) {
-            Text(title)
+            Text(title.wrappingAtAddressSeparators)
                 .font(.body.monospaced())
                 .foregroundStyle(route.isValid ? Color.primary : Color.red)
+                .accessibilityLabel(title)
         } subtitle: {
             Text(subtitle)
         }
@@ -467,16 +483,36 @@ struct HostRouteLabel<Title: View, Subtitle: View, Trailing: View>: View {
                 .frame(width: iconSize, height: iconSize)
                 .background(kind.tint.opacity(0.14), in: .rect(cornerRadius: 8))
                 .accessibilityHidden(true)
+            // The text takes the row's free width itself: a spacer here
+            // would add the stack's spacing twice over and wrap an address
+            // that fits beside the tag.
             VStack(alignment: .leading, spacing: 2) {
                 title
                 subtitle
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
             trailing
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+extension String {
+    /// This address for a route's row, where a tag narrows the line: it
+    /// wraps before a `.` or a `:` when it has to wrap, so a long address
+    /// keeps each label and its port whole. Display only; the zero-width
+    /// spaces stay out of anything read back or spoken.
+    var wrappingAtAddressSeparators: String {
+        var wrapping = ""
+        for character in self {
+            if (character == "." || character == ":"), !wrapping.isEmpty {
+                wrapping.append("\u{200B}")
+            }
+            wrapping.append(character)
+        }
+        return wrapping
     }
 }
 

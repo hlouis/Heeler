@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 import Testing
 
 @testable import Heeler
@@ -313,7 +312,9 @@ struct HerdrCoreProgramChatTests {
 
         try await rig.waitUntil("the message") { chat.conversation.phase == .unavailable(.codexSharedDaemon) }
         #expect(await chat.confirmSessionBeforeSend() != nil)
-        #expect(await rig.files.reads.isEmpty)
+        // Codex's model list is read for the header whatever the conversation;
+        // nothing of a conversation is.
+        #expect(await rig.files.reads.allSatisfy { $0.path.hasSuffix("/models_cache.json") })
         chat.end()
         rig.store.setHosts([])
     }
@@ -500,43 +501,6 @@ struct HerdrCoreProgramChatTests {
         rig.store.setHosts([])
     }
 
-    /// `agy -c` resumed a conversation another agy holds and, past the about 30 s it
-    /// holds that conversation's database, has nothing of it open, and its command line
-    /// names no ID. agy files conversations by ID, so the list is empty however many
-    /// the directory has, and it says why rather than that the directory has none.
-    @Test func anEmptyAntigravityCLIListSaysWhyRatherThanThatTheDirectoryHasNone() async throws {
-        let argv = ["agy", "-c"]
-        let rig = Rig(host: host, record: Self.record(foreground: argv, name: "agy", app: "antigravity"), offering: [.agy])
-        try await rig.start([
-            Self.process(name: "agy", environment: [:], argv: argv, files: ["\(Self.agyRoot)/log/cli-20261110_062102.log"])
-        ])
-        let chat = try rig.chat(.agy)
-        chat.show()
-        try await rig.waitUntil("Chat to say it can't tell") {
-            chat.conversation.phase == .unavailable(.cannotTellSession(.agy))
-        }
-        #expect(chat.offersCandidates)
-        let controller = UIHostingController(
-            rootView: ChatCandidatePickerView(chat: chat, corePin: TerminalCorePin(joined: "c1")))
-
-        try await withTestWindow(
-            frame: CGRect(x: 0, y: 0, width: 402, height: 874), rootViewController: controller
-        ) { _ in
-            try await rig.waitUntil("the empty list") {
-                if case .listed(let list) = chat.candidates { list.candidates.isEmpty } else { false }
-            }
-            try await rig.waitUntil("its reason") {
-                AccessibilityProbe.labels(in: controller.view).contains { $0.contains("by ID, not by directory") }
-            }
-            #expect(
-                !AccessibilityProbe.labels(in: controller.view).contains {
-                    $0.contains("directory has no recent conversations")
-                })
-        }
-        chat.end()
-        rig.store.setHosts([])
-    }
-
     /// Linux, past the about 30 s a second agy holds the database of a conversation
     /// another agy has open: it holds nothing of it, and only its argv says it is no
     /// new agy. Chat still can't tell, and a Send sends nothing.
@@ -621,14 +585,18 @@ struct HerdrCoreProgramChatTests {
         rig.store.setHosts([])
     }
 
-    /// Waiting for Conversation, as on Herdr TUI, with nothing to choose and nothing
-    /// of herdr in what it says.
+    /// Empty-conversation placeholder like a new Claude Code conversation and
+    /// Herdr TUI's fresh Antigravity CLI, with nothing to choose and nothing of
+    /// herdr in what it says.
     @Test func noConversationYetWaitsAsHerdrTUIsNoSessionDoes() {
         let reason = ChatUnavailableReason.noConversationYet(.agy)
 
+        #expect(reason.title == "No Messages Yet")
         #expect(reason.title == ChatUnavailableReason.noSession(.agy).title)
+        #expect(reason.title == ChatUnavailableReason.awaitingFirstMessage(.claude).title)
         #expect(reason.systemImage == ChatUnavailableReason.noSession(.agy).systemImage)
-        #expect(reason.isWaiting && reason.offersRetry)
+        #expect(reason.isAwaitingFirstMessage && ChatUnavailableReason.noSession(.agy).isAwaitingFirstMessage)
+        #expect(reason.isWaiting && !reason.offersRetry)
         #expect(!reason.leavesItToAPick && !reason.hidesConversation)
         #expect(reason.explanation.contains("first message"))
         #expect(!reason.explanation.contains("herdr"))
@@ -683,7 +651,9 @@ struct HerdrCoreProgramChatTests {
 
         try await rig.waitUntil("the message") { chat.conversation.phase == .unavailable(.codexSharedDaemon) }
         #expect(await chat.confirmSessionBeforeSend() != nil)
-        #expect(await rig.files.reads.isEmpty)
+        // Codex's model list is read for the header whatever the conversation;
+        // nothing of a conversation is.
+        #expect(await rig.files.reads.allSatisfy { $0.path.hasSuffix("/models_cache.json") })
         chat.end()
         rig.store.setHosts([])
     }

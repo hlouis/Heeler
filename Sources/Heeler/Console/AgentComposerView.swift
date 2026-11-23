@@ -295,6 +295,11 @@ struct AgentComposerView: View {
     /// Focus has left but the keyboard has not started down. The fold waits, so
     /// that it and the keyboard move the conversation as one motion.
     var keyboardIsLeaving = false
+    /// Chat's conversation scrolls beneath its Composer, so there the card is
+    /// glass the rows show through, and the status row rides on it instead
+    /// of lying bare over them. The terminal ends above its Composer, whose
+    /// card stays the theme's background.
+    var floatsOverConversation = false
     /// What Stop presses in the Agent's program, its wait and its hint; nil
     /// keeps Send.
     var interrupt: AgentComposerInterrupt? = nil
@@ -307,6 +312,9 @@ struct AgentComposerView: View {
     @State private var isVoiceSetupPresented = false
     @State private var previewedImage: ComposerImagePreviewSheet.Item?
     @State private var isInputFocused = false
+    /// Until `onAppear` has settled where the keyboard goes; see
+    /// `inheritsPendingKeyboard`.
+    @State private var isOpening = true
     /// An explicit dismissal hides suggestions for the current trigger token;
     /// removing the token arms them again.
     @State private var isSuggestionsDismissed = false
@@ -328,15 +336,14 @@ struct AgentComposerView: View {
         let _ = PerfTrace.count("AgentComposerView.body")
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                AgentDetailStatusChrome(
-                    status: status,
-                    hostTelemetry: hostTelemetry,
-                    changes: changes,
-                    session: session,
-                    sessionControls: sessionControls,
-                    chromeColorScheme: chromeColorScheme)
+                if !floatsOverConversation { statusChrome }
 
                 VStack(spacing: 0) {
+                    if floatsOverConversation {
+                        // Clear of the keyboard grabber while it shows.
+                        statusChrome
+                            .padding(.top, isKeyboardPresented ? 16 : 10)
+                    }
                     inputArea
                         .modifier(ComposerInputReplacement(replacement: inputReplacement ?? liveVoiceRecorder))
                         .padding(inputAreaInsets)
@@ -349,17 +356,10 @@ struct AgentComposerView: View {
                         switchKeyboard: keyboardSwitchAction,
                         modeControl: modeControl)
                 }
-                // Opaque in the theme's background, so Chat scrolling under
-                // it stays out of the way, then veiled.
-                .background {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(themeColors.background)
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .fill(ThemeVeil.card)
-                        }
-                }
+                // What the card holds keeps to its corners; the glass behind
+                // it draws its own edge.
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .modifier(ComposerCardSurface(isGlass: floatsOverConversation))
                 .overlay {
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
                         .fill(Color.accentColor.opacity(dropHighlight.fillOpacity))
@@ -392,11 +392,19 @@ struct AgentComposerView: View {
             }
         }
         .sheet(item: $previewedImage) { item in
-            ComposerImagePreviewSheet(item: item) {
-                previewedImage = nil
+            switch item.kind {
+            case .image:
+                ComposerImagePreviewSheet(item: item) {
+                    previewedImage = nil
+                }
+                .presentationDetents([.large])
+                .ignoresSafeArea()
+            case .video:
+                ComposerVideoPreviewSheet(item: item) {
+                    previewedImage = nil
+                }
+                .presentationDetents([.large])
             }
-            .presentationDetents([.large])
-            .ignoresSafeArea()
         }
         .onChange(of: store.imageAttachments.map(\.id)) { _, ids in
             if let current = previewedImage, !ids.contains(current.id) {
@@ -404,10 +412,12 @@ struct AgentComposerView: View {
             }
         }
         .onAppear {
-            guard inheritsKeyboardHandoff,
-                  let selectedID = switcher.selectedID,
-                  keyboardHandoff.consume(selectedID)
-            else { return }
+            defer { isOpening = false }
+            guard inheritsKeyboardHandoff else { return }
+            // A handoff carries the keyboard up from the screen before. With
+            // none, a hardware keyboard still opens the Agent ready to type.
+            let inherits = switcher.selectedID.map { keyboardHandoff.consume($0) } ?? false
+            guard inherits || opensFocusedOnHardwareKeyboard else { return }
             setKeyboardPresentation(.system)
             isInputFocused = true
         }
@@ -430,6 +440,7 @@ struct AgentComposerView: View {
         }
         .onChange(of: isInputFocused) { _, isFocused in
             keyboardPresentationFollowsFocus(isFocused)
+            if isFocused { keyboardHandoff.keyboardCameUp() }
         }
         .onChange(of: store.draft) { _, _ in
             if commandMenu != nil {
@@ -445,6 +456,16 @@ struct AgentComposerView: View {
                 Task { await skills.loadIfNeeded() }
             }
         }
+    }
+
+    private var statusChrome: some View {
+        AgentDetailStatusChrome(
+            status: status,
+            hostTelemetry: hostTelemetry,
+            changes: changes,
+            session: session,
+            sessionControls: sessionControls,
+            chromeColorScheme: chromeColorScheme)
     }
 
     /// Pull down to hide the keyboard. It sits in the card's top inset, so
@@ -871,8 +892,18 @@ struct AgentComposerView: View {
     }
 
     private var inputAreaInsets: EdgeInsets {
-        EdgeInsets(
-            top: isCollapsed ? (store.imageAttachments.isEmpty ? 6 : 10) : (store.imageAttachments.isEmpty ? 12 : 14),
+        // Under the status row on a floating card, which already keeps the
+        // input off the card's top edge.
+        let top: CGFloat =
+            if floatsOverConversation {
+                store.imageAttachments.isEmpty ? 4 : 10
+            } else if isCollapsed {
+                store.imageAttachments.isEmpty ? 6 : 10
+            } else {
+                store.imageAttachments.isEmpty ? 12 : 14
+            }
+        return EdgeInsets(
+            top: top,
             leading: 12,
             bottom: isCollapsed ? 6 : 8,
             trailing: 12)
@@ -903,11 +934,24 @@ struct AgentComposerView: View {
                 openVoiceInputSettings: { isVoiceSetupPresented = true }))
     }
 
-    /// A keyboard handed over by the screen this one replaces, read without
-    /// consuming it (`onAppear` does), so the first frame is already open.
+    /// A keyboard on its way as the Composer opens, so the first frame is
+    /// already open: one handed over by the screen this one replaces, read
+    /// without consuming it (`onAppear` does), or a hardware keyboard's.
     private var inheritsPendingKeyboard: Bool {
-        guard inheritsKeyboardHandoff, let selectedID = switcher.selectedID else { return false }
+        guard inheritsKeyboardHandoff else { return false }
+        if isOpening, opensFocusedOnHardwareKeyboard { return true }
+        guard let selectedID = switcher.selectedID else { return false }
         return keyboardHandoff.mode(for: selectedID) != nil
+    }
+
+    /// Whether a hardware keyboard puts the caret in the input as the
+    /// Composer opens (`TerminalKeyboardHandoff.opensFocused`). Not while a
+    /// responder handoff is settling the keyboard itself, and not under a
+    /// card or the recorder in the input's place, which have nothing to type
+    /// into.
+    private var opensFocusedOnHardwareKeyboard: Bool {
+        keyboardHandoff.opensFocused && keyboardHandoffID == nil
+            && inputReplacement == nil && liveVoiceRecorder == nil
     }
 
     /// The invocation token at the end of the draft, when this agent has
@@ -931,6 +975,7 @@ struct AgentComposerView: View {
     private func dismissOrPresentKeyboard() {
         if isKeyboardPresented {
             hideKeyboard()
+            keyboardHandoff.keyboardWasPutAway()
         } else {
             setKeyboardPresentation(.system)
             isInputFocused = true
@@ -947,6 +992,7 @@ struct AgentComposerView: View {
         guard isKeyboardPresented else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         hideKeyboard()
+        keyboardHandoff.keyboardWasPutAway()
     }
 
     private func switchKeyboard() {
@@ -1066,6 +1112,27 @@ struct AgentComposerView: View {
         store.voice.isInRecordingMode ? 1.5 : dropHighlight.strokeWidth
     }
 
+}
+
+/// The Composer card's surface: the theme's background a step deeper where
+/// the card sits on it, glass in that background where the conversation
+/// scrolls beneath (`AgentComposerView.floatsOverConversation`).
+private struct ComposerCardSurface: ViewModifier {
+    let isGlass: Bool
+    @Environment(\.themeColors) private var themeColors
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
+        if isGlass {
+            content.themeGlass(in: shape, theme: themeColors)
+        } else {
+            content.background {
+                shape
+                    .fill(themeColors.background)
+                    .overlay { shape.fill(ThemeVeil.card) }
+            }
+        }
+    }
 }
 
 /// The inline suggestion menu above the Composer's text area: the Skills the
@@ -1511,21 +1578,25 @@ final class AgentComposerUITextView: UITextView {
     private var laidOutHeight: CGFloat = 0
     /// Sends the draft for a hardware Return, the way the Send button does.
     var onHardwareReturn: (() -> Void)?
-    /// Stages the clipboard's image. A text view takes only text, so without it a
-    /// paste of an image, from the edit menu or the keyboard, does nothing.
+    /// Stages the clipboard's image or video. A text view takes only text, so
+    /// without it a paste of media from the edit menu or keyboard does nothing.
     var onPasteImage: (() -> Void)?
 
-    private var pastesImage: Bool {
+    private var pastesAttachment: Bool {
         let board = UIPasteboard.general
-        return onPasteImage != nil && board.hasImages && !board.hasStrings
+        return onPasteImage != nil
+            && ClipboardAttachment.canPasteInTextView(
+                types: board.types,
+                hasImages: board.hasImages,
+                hasStrings: board.hasStrings)
     }
 
     /// The keyboard's clipboard suggestion, the edit menu and ⌘V all send this.
     /// `paste(itemProviders:)` stays UITextView's: UIKit calls it only after
     /// `canPaste(_:)`, which UITextView grants to text alone, so taking the
-    /// clipboard's image there would replace the text it was handed.
+    /// clipboard's media there would replace the text it was handed.
     override func paste(_ sender: Any?) {
-        if pastesImage, let onPasteImage {
+        if pastesAttachment, let onPasteImage {
             onPasteImage()
         } else {
             super.paste(sender)
@@ -1533,7 +1604,7 @@ final class AgentComposerUITextView: UITextView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if action == #selector(UIResponderStandardEditActions.paste(_:)), pastesImage { return true }
+        if action == #selector(UIResponderStandardEditActions.paste(_:)), pastesAttachment { return true }
         return super.canPerformAction(action, withSender: sender)
     }
     /// Return presses taken for sending. Their releases stay here too, and

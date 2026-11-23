@@ -10,11 +10,14 @@ Compose scripts live with their exports:
 | --- | --- | --- |
 | iPhone large display | `output/app-store/iphone-6.9/` | `compose_mockups.py` |
 | iPad 13-inch | `output/app-store/ipad-13/` | `compose_mockups.py` |
-| iPhone Duo, first image | `output/app-store/iphone-duo/` | `compose_mockups.py` |
-| Herdr desktop, second image of all three | `output/app-store/desktop/` | `compose_desktop.py` |
+| iPhone Duo, framed images | `output/app-store/iphone-duo/` | `compose_mockups.py` |
+| Servers, second image of all three | `output/app-store/servers/` | `compose_servers.py` |
 | Voice Input, third image of all three | `output/app-store/voice/` | `compose_voice.py` |
 | Header and Search Results | `output/app-store/creative-assets/` | `compose_creative.py` |
 | Listing text (`promo`, `keywords`, `description`) | `output/app-store/copy/` | `test-store-shots.py` |
+
+`output/app-store/backdrop.py` draws the graphite background of the iPhone and
+iPad images. The compose scripts need Pillow and NumPy.
 
 ## 1. Start the Agents
 
@@ -65,27 +68,61 @@ acting. Press the unfolded posture button in the window's bottom toolbar, then:
 xcrun simctl io "$UDID" screenshot --display=primary-1 capture.png
 ```
 
-That gives 2853 x 2007 in landscape. XCUITest taps miss in this posture on
-Xcode 27, so click through the Device Hub window.
+That gives 2853 x 2007 in landscape. In this posture on Xcode 27 an XCUITest
+tap at an absolute offset misses. Tap an element, or a coordinate normalized to
+the app's window; a click through the Device Hub window lands too.
 
-### Herdr desktop
+### Lock Screen
 
-The rig has no herdr-core, so this image needs a Linux machine running the
-Herdr desktop app, such as a throwaway VM. Copy the fixture repositories there,
-log Claude Code in, and add the machine to the seeded simulator as a herdr-core
-Host. Start each Agent from Heeler's New Agent with a New Workspace, so the
-desktop names its space. The image cuts the Hosts card and the Agents list
-filtered to that Host.
+The Live Activity image is a real activity on the simulator's Lock Screen. Turn
+on Settings › Notifications and the Host's switch there, start the activity from
+the Host's page, then lock the simulator and allow Live Activities when the
+Lock Screen first asks.
 
-The Hosts card shows `user@address`, so every Host gets a machine name
-(`studio-mac`, `build-server`, `linux-desktop`) on port 22 and the same user
-name. Route all three through a jump host on the Mac that maps each name to a
-local port: the rig's sshd, or a forward to the VM's sshd. A small asyncssh
-server that only accepts `direct-tcpip` is enough. A jump host on the VM sends
-the Herdr TUI Hosts across its network twice, and the card then shows
-latencies of several seconds. Agent rows shorten a path to `~` only under
-`/Users/<user>` or `/home/<user>`, so the VM account needs that user name and
-home.
+The card lists three of the Host's Agents, Blocked before Done before Working.
+Payments API, Auth Service and Release CLI are on Build Server, so Studio Mac's
+card never shows them. Open Done Agents until one is left. If none is left,
+give an idle Agent on the Host a small task and wait for Done:
+
+```sh
+python3 scripts/isolated-herdr-backend.py --root /tmp/heeler-shots run --session default -- \
+  agent prompt dark-mode "Add a short JSDoc comment above each exported function in src/settings.js."
+```
+
+Then run `store-shots.py working`, wait a few seconds after Search's ring turns
+in the app so the activity has the row, lock, and press Home once: a screen
+that has just locked is dim and has no status bar. Capture about three seconds
+later, when "Swipe up to open" has settled. Search finishes a task it has done
+before within about fifteen seconds, so a second take needs a new prompt for
+`search-ranking`.
+
+The kept capture set its clock with a full timestamp,
+`simctl status_bar override --time 2026-11-22T09:41:00.000+08:00`; ISO forms
+without milliseconds are rejected. The README and the landing page use a
+capture taken with `--mask=ignored`, which keeps the corners square.
+
+### Servers
+
+This image needs one Host that runs Herdr TUI, herdr-core, tmux and Rex, which
+`store-shots.py up` does not build. Start an isolated backend
+(`scripts/isolated-herdr-backend.py --root DIR start`) and add the other three
+behind its sshd, which runs every command with `DIR/home` as `HOME`:
+
+- tmux: link `tmux` into `DIR/bin`, start a server with `TMUX_TMPDIR` under
+  `DIR`, and export the same `TMUX_TMPDIR` from `DIR/force-command.sh`.
+- herdr-core: link the binary to `DIR/home/.local/bin/herdr-core` and start a
+  core with that `HOME`.
+- Rex: run `rex server run --listen "DIR/home/Library/Application Support/rex/server.sock"`
+  with a state directory under `DIR`.
+
+The Hosts row shows `user@address`, so give the sshd a machine name:
+`dns-sd -P "Studio Mac" _ssh._tcp local PORT studio-mac.local 127.0.0.1`
+answers `studio-mac.local` while it runs. Check that the sshd's port is free on
+every address before choosing it. Any port but 22 shows in the row.
+
+Add the Host through Add Manually, so the wizard finds all four Servers. The
+image cuts the Hosts list's row and the Host page's Servers section. The
+iPhone Duo image reuses the iPhone captures.
 
 ### Voice Input
 

@@ -32,6 +32,12 @@ protocol TransportConnector: Sendable {
     /// Host's trusted key first; nil when none does. It signs in nowhere and
     /// keeps no connection (ADR 0058).
     func reachableRoute(among candidates: [Int], settings: SSHTransportSettings) async -> Int?
+
+    /// Dials a Host for a port preview's pages: SSH and nothing past it, on
+    /// a connection none of the Host's Servers uses (ADR 0062).
+    func connectForPortPreview(
+        settings: SSHTransportSettings
+    ) async throws -> any PortPreviewConnection
 }
 
 extension TransportConnector {
@@ -45,6 +51,12 @@ extension TransportConnector {
         settings: SSHTransportSettings
     ) async throws -> any ServerKindDetectionConnection {
         throw TransportError.hostFeatureUnavailable(feature: String(localized: "Server Kind detection"))
+    }
+
+    func connectForPortPreview(
+        settings: SSHTransportSettings
+    ) async throws -> any PortPreviewConnection {
+        throw TransportError.hostFeatureUnavailable(feature: String(localized: "Port Preview"))
     }
 
     /// A connector that serves only Herdr TUI Hosts says so.
@@ -94,6 +106,12 @@ struct SSHTransportConnector: TransportConnector {
         await HeelerSSHTransport.reachableRoute(among: candidates, settings: settings)
     }
 
+    func connectForPortPreview(
+        settings: SSHTransportSettings
+    ) async throws -> any PortPreviewConnection {
+        try await HeelerSSHTransport.connect(settings: settings)
+    }
+
     func connectCore(settings: SSHTransportSettings) async throws -> any HerdrCoreTransport {
         HerdrCoreSSHTransport(
             connection: try await HeelerSSHTransport.connect(settings: settings),
@@ -123,12 +141,14 @@ extension SSHTransportSettings {
     /// Network, if it names one; the route itself fails the dial when that
     /// network has since been removed. The race runs only while no connection
     /// to the Host stands: `routeLeases` keeps the route they hold (ADR 0058).
+    /// `sftpRefusals` keeps the Host's refusal of SFTP past one connection.
     init(
         host: Host,
         credentials: SSHCredentials,
         hostKeyPolicy: HostKeyPolicy,
         overlays: OverlayNetworkRuntime = .shared,
-        routeLeases: HostRouteLeases = .shared
+        routeLeases: HostRouteLeases = .shared,
+        sftpRefusals: HostSFTPRefusals = .shared
     ) {
         self.init(
             routes: host.routes.map { route in
@@ -156,6 +176,7 @@ extension SSHTransportSettings {
             hostKeyTrust: .host(host.id),
             socket: host.socketLocation)
         routeLease = HostRouteLease(host: HostMachine.Connection(host), leases: routeLeases)
+        sftpRefusal = sftpRefusals.refusal(for: HostMachine.Connection(host))
         serverKind = host.serverKind
         coreSessionName = HerdrCoreSessionName.normalized(host.sessionName)
         tmuxSocketName = host.tmuxSocketName

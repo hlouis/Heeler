@@ -43,7 +43,7 @@ struct HostRemovalRequest: Equatable {
                 String(localized: "Its Agents, Terminals and notifications leave this device, and its Notification Key is deleted from the Keychain.")
             ]
             if leavesNotificationsBehind { sentences.append(unreachable) }
-            return sentences.joined(separator: " ")
+            return sentences.joinedAsSentences()
         }
         var sentences = [
             deletesNotificationKey
@@ -52,7 +52,7 @@ struct HostRemovalRequest: Equatable {
         ]
         if leavesNotificationsBehind { sentences.append(unreachable) }
         sentences.append(String(localized: "This cannot be undone."))
-        return sentences.joined(separator: " ")
+        return sentences.joinedAsSentences()
     }
 }
 
@@ -384,7 +384,7 @@ struct HostListView: View {
                     ContentUnavailableView {
                         Label("No Hosts", systemImage: "server.rack")
                     } description: {
-                        Text("Add a machine that runs herdr to get started.")
+                        Text("Add a machine that runs herdr, tmux or Rex to get started.")
                     } actions: {
                         // Scan to Pair is the primary add-Host action; the
                         // manual form is the fallback (ADR 0007).
@@ -706,7 +706,7 @@ struct HostListView: View {
                     .fixedSize()
                 HostMachineRowContent(
                     presentation: entry.presentation, unseen: entry.unseen,
-                    updateTag: entry.updateTag, showsTrailing: !isRemoving)
+                    updateTag: entry.updateTag, showsTrailing: !isRemoving && stopped.isEmpty)
                 if isRemoving {
                     ProgressView()
                         .controlSize(.small)

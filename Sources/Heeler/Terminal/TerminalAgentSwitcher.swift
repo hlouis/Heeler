@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import UIKit
 
@@ -31,11 +32,22 @@ extension TerminalAgentSwitcherItem {
 
     /// The strip's chips, in the Console's order. A chip shows only Row 1,
     /// so chips whose Row 1 reads the same carry their program's name.
+    ///
+    /// `hostFilter` is the lists' Host filter: the strip offers the Agents
+    /// on the Hosts the lists show, and empty offers every Host's. Neither
+    /// the Agents list's status filter nor its search narrows the strip. The
+    /// Agent on screen, `shownID`, keeps its chip on a Host outside the
+    /// filter (a notification opens one there), so the strip always marks
+    /// where the user is.
     @MainActor
     static func items(
-        for agents: [ConsoleAgent], pins: PinnedAgentsStore,
+        for agents: [ConsoleAgent], onHosts hostFilter: Set<Host.ID> = [],
+        showing shownID: ConsoleAgent.ID? = nil, pins: PinnedAgentsStore,
         layout: (Host.ID) -> AgentRowLayout
     ) -> [TerminalAgentSwitcherItem] {
+        let agents = hostFilter.isEmpty
+            ? agents
+            : agents.filter { hostFilter.contains($0.hostID) || $0.id == shownID }
         let qualifiers = AgentTitleQualifier.qualifiers(for: agents) { agent in
             let card = AgentCardPresentation(agent: agent, layout: layout(agent.hostID))
             return .init(title: card.switcherTitle, namesAgent: card.namesAgent(inFirst: 1))
@@ -56,6 +68,26 @@ struct TerminalAgentSwitcher {
     var onTogglePin: @MainActor (ConsoleAgent.ID) -> Void
 }
 
+/// Whether a hardware keyboard is attached right now.
+struct HardwareKeyboard {
+    let isConnected: @MainActor () -> Bool
+
+    /// None: every screen behaves as it does on touch.
+    static let absent = HardwareKeyboard { false }
+
+    /// The device's. `GCKeyboard.coalesced` is never nil on the Simulator,
+    /// whose software keyboard would then come up over every Agent that
+    /// opens, so there the `-simulatesHardwareKeyboard YES` launch argument
+    /// says one is attached.
+    static let system = HardwareKeyboard {
+        #if targetEnvironment(simulator)
+        UserDefaults.standard.bool(forKey: "simulatesHardwareKeyboard")
+        #else
+        GCKeyboard.coalesced != nil
+        #endif
+    }
+}
+
 /// Carries the user's "I am still typing" intent across the Agent surface
 /// teardown a switch forces. Deliberately not observable: arming it must not
 /// invalidate the SwiftUI view that is about to be replaced anyway, and the
@@ -64,6 +96,36 @@ struct TerminalAgentSwitcher {
 final class TerminalKeyboardHandoff {
     private var armedID: ConsoleAgent.ID?
     private var armedMode: TerminalKeyboardMode = .text
+    private let hardwareKeyboard: HardwareKeyboard
+    /// The user put the keyboard away; see `opensFocused`.
+    private var isKeptDown = false
+    /// Whether a sheet or an alert stands over the Agent's screen. Its owner
+    /// sets this; see `opensFocused`.
+    var isCovered: @MainActor () -> Bool = { false }
+
+    init(hardwareKeyboard: HardwareKeyboard = .absent) {
+        self.hardwareKeyboard = hardwareKeyboard
+    }
+
+    /// Whether an Agent that opens with no handoff takes the keyboard
+    /// anyway. With a hardware keyboard attached, focus brings up iPadOS's
+    /// shortcut bar and no software keyboard, so nothing covers the screen
+    /// and the first key typed should reach the Agent (#646). A keyboard the
+    /// user put away stays away until it comes up again or a keyboard
+    /// connects. An Agent's screen rebuilt under a sheet leaves the keys
+    /// with the sheet: no handoff says the user meant them for the Agent.
+    var opensFocused: Bool { !isKeptDown && hardwareKeyboard.isConnected() && !isCovered() }
+
+    /// The user hid the keyboard with its button or a pull, not a screen
+    /// putting it away on its own.
+    func keyboardWasPutAway() {
+        isKeptDown = true
+    }
+
+    /// The keyboard came up, or a hardware keyboard connected.
+    func keyboardCameUp() {
+        isKeptDown = false
+    }
 
     func arm(for id: ConsoleAgent.ID, mode: TerminalKeyboardMode = .text) {
         armedID = id
@@ -122,6 +184,23 @@ final class TerminalKeyboardHandoff {
     }
 }
 
+/// Where a window's Agent strip is scrolled to, carried across the Agent
+/// surface teardown a switch forces. The strip that comes back starts where
+/// the last one stood, so a chip that was fully on screen stays where the
+/// user tapped it instead of landing against the strip's edge. Not
+/// observable, like `TerminalKeyboardHandoff`: a strip reads it once, as it
+/// is made.
+@MainActor
+final class TerminalAgentSwitcherScroll {
+    var offset: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    /// The window's strip position, for each strip made in it. Nil outside
+    /// the Console, where a strip starts at its first chip.
+    @Entry var agentSwitcherScroll: TerminalAgentSwitcherScroll? = nil
+}
+
 /// The switcher row: a horizontally scrolling strip of Agent chips, resting
 /// on the terminal's bottom edge so switching Agents never costs a trip back
 /// to the Console.
@@ -161,6 +240,16 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
     private var items: [TerminalAgentSwitcherItem] = []
     private var selectedID: ConsoleAgent.ID?
     private var scrollsToSelectionOnLayout = false
+    /// Where the window's last strip stood, which this one starts from. Kept
+    /// through every layout pass until the user scrolls or the selection
+    /// changes here: the strip is measured over several passes, and an early
+    /// one clamps the offset against a content width still short of its chips.
+    private var restoredOffset: CGFloat?
+    /// Told where this strip stands, for the next one; see
+    /// `TerminalAgentSwitcherScroll`.
+    var scroll: TerminalAgentSwitcherScroll? {
+        didSet { restoredOffset = scroll?.offset }
+    }
     private var pendingUpdate: (items: [TerminalAgentSwitcherItem], selectedID: ConsoleAgent.ID?)?
 
     override init(frame: CGRect) {
@@ -200,6 +289,11 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
         let span = PerfTrace.begin("switcher.update")
         defer { PerfTrace.end(span) }
         let selectionChanged = selectedID != self.selectedID
+        // A strip that stays through a switch already stands where the user
+        // left it.
+        if selectionChanged, self.selectedID != nil {
+            restoredOffset = nil
+        }
         let previousIDs = chips.map(\.id)
         let previousPinByID = Dictionary(
             self.items.map { ($0.id, $0.isPinned) }, uniquingKeysWith: { first, _ in first })
@@ -302,10 +396,12 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
 
     /// An Agent switch builds a whole new terminal, so the strip that comes
     /// back starts at offset zero — with the chip the user just picked off
-    /// screen if the list is long. The strip is measured over several passes
-    /// (no width at all on the first update, chip widths later still), so
-    /// rather than firing once, it keeps the open Agent in view on every
-    /// layout until the user scrolls it themselves.
+    /// screen if the list is long. It starts from where the window's last
+    /// strip stood instead (`restoredOffset`), and moves only when the open
+    /// Agent's chip is not fully in view there. The strip is measured over
+    /// several passes (no width at all on the first update, chip widths
+    /// later still), so rather than firing once, it keeps the open Agent in
+    /// view on every layout until the user scrolls it themselves.
     override func layoutSubviews() {
         super.layoutSubviews()
         guard scrollsToSelectionOnLayout,
@@ -325,19 +421,28 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
         guard visibleWidth > 0, contentWidth > 0, chipFrame.width > 0 else { return }
 
         // Scrolled by hand rather than with `scrollRectToVisible`: that one is
-        // a no-op mid-layout, which is exactly when the strip needs it. Move
-        // the least that brings the chip and its gutter fully into view, so a
-        // chip already on screen does not shift under the user.
+        // a no-op mid-layout, which is exactly when the strip needs it. A
+        // chip wholly in view stays where it is, with or without its gutter,
+        // so it does not shift under the user; one that is cut off moves the
+        // least that brings it and its gutter into view.
         let leading = chipFrame.minX - TerminalAgentChip.spacing
         let trailing = chipFrame.maxX + TerminalAgentChip.spacing
-        var offsetX = scrollView.contentOffset.x
-        if trailing > offsetX + visibleWidth {
+        // Where the last strip stood is first held to what this one can
+        // show: its chips may be fewer, and a chip in view at the nearest
+        // offset this strip reaches must not move either.
+        let maxOffsetX = max(contentWidth - visibleWidth, 0)
+        var offsetX = min(max(restoredOffset ?? scrollView.contentOffset.x, 0), maxOffsetX)
+        if chipFrame.maxX > offsetX + visibleWidth {
             offsetX = trailing - visibleWidth
         }
-        if leading < offsetX {
+        if chipFrame.minX < offsetX {
             offsetX = leading
         }
-        offsetX = min(max(offsetX, 0), max(contentWidth - visibleWidth, 0))
+        offsetX = min(max(offsetX, 0), maxOffsetX)
+        // A strip already taken off screen is no longer where the user is.
+        if window != nil {
+            scroll?.offset = offsetX
+        }
         guard offsetX != scrollView.contentOffset.x else { return }
         scrollView.contentOffset.x = offsetX
     }
@@ -355,6 +460,7 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
     /// view; the next switch arms it again.
     func scrollViewWillBeginDragging(_: UIScrollView) {
         scrollsToSelectionOnLayout = false
+        restoredOffset = nil
     }
 
     /// A scroll position the user did not ask for — UIKit clamping the strip
@@ -364,7 +470,15 @@ final class TerminalAgentSwitcherBar: UIView, UIScrollViewDelegate,
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard scrollsToSelectionOnLayout,
               !scrollView.isDragging, !scrollView.isDecelerating
-        else { return }
+        else {
+            // Where the user put the strip, for the next one to start from.
+            // A strip not yet laid out still reads zero, which is nobody's
+            // choice.
+            if !scrollsToSelectionOnLayout, restoredOffset == nil, window != nil {
+                scroll?.offset = scrollView.contentOffset.x
+            }
+            return
+        }
         setNeedsLayout()
     }
 
@@ -657,12 +771,13 @@ struct TerminalAgentSwitcherRow: View {
     private static let glyphSlotSize: CGFloat = 18
     private static let groupedGlyphOffset: CGFloat = 2
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.agentSwitcherScroll) private var scroll
 
     private var hairline: CGFloat { 1 / max(displayScale, 1) }
 
     var body: some View {
         HStack(spacing: 0) {
-            StripRepresentable(switcher: switcher)
+            StripRepresentable(switcher: switcher, scroll: scroll)
             // Fences the pinned button off from the strip, so the chips read
             // as a list that ends rather than as one the button belongs to.
             Rectangle()
@@ -746,9 +861,12 @@ struct TerminalAgentSwitcherRow: View {
 
     private struct StripRepresentable: UIViewRepresentable {
         let switcher: TerminalAgentSwitcher
+        let scroll: TerminalAgentSwitcherScroll?
 
         func makeUIView(context _: Context) -> TerminalAgentSwitcherBar {
-            TerminalAgentSwitcherBar()
+            let bar = TerminalAgentSwitcherBar()
+            bar.scroll = scroll
+            return bar
         }
 
         /// The strip is a scroll view whose content is as wide as its chips,

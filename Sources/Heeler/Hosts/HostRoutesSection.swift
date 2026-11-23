@@ -40,7 +40,8 @@ struct HostConsoleLink {
             routeCount: machine.representative.routes.count,
             servers: machine.servers.map { record in
                 HostRoutesPresentation.Server(
-                    routes: record.routes, status: statuses[record.id], routeID: routeIDs[record.id])
+                    routes: record.routes, status: statuses[record.id], routeID: routeIDs[record.id],
+                    standingFailure: standingFailures[record.id])
             },
             isManualReconnectInFlight: machine.servers.contains { manualReconnects.contains($0.id) })
     }
@@ -79,8 +80,9 @@ struct HostRoutesSection: View {
     private func row(_ index: Int, _ route: HostRoute) -> some View {
         let failure = presentation.failures[index]
         return HostRouteLabel(kind: HostRouteKind(route)) {
-            Text(route.endpointDescription)
+            Text(route.endpointDescription.wrappingAtAddressSeparators)
                 .font(.body.monospaced())
+                .accessibilityLabel(route.endpointDescription)
         } subtitle: {
             if let failure {
                 // Over the label's secondary: the reason is why it is red.

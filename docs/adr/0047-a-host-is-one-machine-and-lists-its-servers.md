@@ -15,6 +15,17 @@ still keeps its own connection, and the connections of one Host now hold one
 Route. A Server's page no longer shows the connection or a Show in Heeler
 switch; Host detail shows the connection under its Routes.
 
+Amended 2026-11-21: the Agents and Terminals lists say one condition for a
+Host, not one for each Server. Their corner status tile and the sheet it opens
+count a Host once, under its name alone, and read it as the By Host heading
+does: connected while any Server is connected, otherwise as the Server that
+most needs the user, a failure of the connection ahead of one Server's own.
+The connection sheet speaks for the Host, and its Retry Now and Stop
+Connecting reach every Server the Host has on. The rows under a By Host
+heading, one for each Server's problem, are gone. A Server that fails on its
+own beside a connected Server of its Host therefore shows on the Hosts tab's
+row and in Host detail, not in the lists.
+
 ADR 0031 bound a Host to one Server Kind, so a machine that ran Herdr TUI and
 tmux was added twice, with the address, account, key and trust typed and
 confirmed each time, and showed as two rows nobody could tell were one
@@ -82,11 +93,11 @@ tmux sockets on one machine, that is the common case, not the odd one.
   tab's order, holding its Servers' Agents in the Console's status-priority
   order (catalog Server order breaking ties) and its Servers' Terminal
   Workspaces one Server after another in catalog order, with the counts summed.
-  The heading reads as the Server that most needs the user, as the Hosts
-  tab's row does; the name stays at full strength while any Server is
-  reachable, and the heading opens a connection sheet only for a Host with
-  one Server on. Each Server's problem is a row under the heading, which names
-  the Server when the Host has more than one. A Workspace stays one Server's:
+  The heading reads as the Hosts tab's row does — connected while any Server
+  is connected, otherwise as the Server that most needs the user — and opens a
+  connection sheet only for a Host with one Server on. Each Server's problem is
+  a row under the heading, which names the Server when the Host has more than
+  one. A Workspace stays one Server's:
   two of one name on two Servers are two cards, both under the Host's name.
   Folding a Host is stored by record id, as the filter is: a Host is folded
   while any of its records is, and folding or unfolding it sets or clears them

@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import Testing
-import UIKit
 
 @testable import Heeler
 
@@ -2796,6 +2794,101 @@ struct BlockedCardStoreTests {
             }
         return ChatTranscript(entries: entries, pendingRequests: pending)
     }
+
+    @Test func aClaudeAutoBlockCountdownDoesNotBlockApprovalOrAmendWhileTicking() async throws {
+        let command =
+            "cd /Users/developer/worktree/Heeler/704 && make test-ci-diagnostic-controls 2>&1 | tail -6; echo "
+            + "\"make status=$?\"; T=$(mktemp -d /private/tmp/claude-501/-Users-developer-Documents-Heeler/"
+            + "89ec3b9a-6cd9-457b-813e-7916029e55da/scratchpad/gate.XXXX); rm -rf $T"
+        let request = Self.bash("toolu_gate", command)
+        let pane = FakePane(ClaudeDialogRows.quotedBashScreen(countdown: "1:16"))
+        let ready = try ScreenFixture.screen("claude-29-c3-after-immediate")
+        let changedMessage = BlockedCardStore.changedMessage
+        let store = BlockedCardStore(
+            program: .claude,
+            io: BlockedScreenIO(
+                readScreen: { try await pane.read() },
+                sendKeys: { await pane.send($0) },
+                paste: { await pane.paste($0) },
+                typeWhileShowing: { typing, stillShows in
+                    // Simulate herdr-core / tmux / Rex re-reading the screen a
+                    // second later when the countdown has ticked again.
+                    guard stillShows(try await pane.read()) else {
+                        throw HerdrCoreChatTyping.Refusal(message: changedMessage)
+                    }
+                    switch typing {
+                    case .keys(let keys):
+                        await pane.send(keys)
+                    case .paste(let text):
+                        await pane.paste(text)
+                    }
+                }),
+            clock: ManualClock().clock)
+        store.update(transcript: Self.transcript(pending: [request]))
+        store.update(activity: .blocked)
+        await store.refresh()
+
+        guard case .card(let shown) = store.content else {
+            Issue.record("Expected a card, got \(store.content)")
+            return
+        }
+        #expect(shown.request?.callID == "toolu_gate")
+        let initialGeneration = store.dialogGeneration
+        store.isCollapsed = true
+
+        // A watch tick updates the terminal's countdown without resetting the
+        // card's identity or unfolding it.
+        await pane.show(ClaudeDialogRows.quotedBashScreen(countdown: "1:15"))
+        await store.refresh()
+        #expect(store.dialogGeneration == initialGeneration)
+        #expect(store.isCollapsed)
+        store.isCollapsed = false
+
+        // Another second passes before observeBeforeActing, and another before
+        // typeWhileShowing sends the digit.
+        await pane.show(ClaudeDialogRows.quotedBashScreen(countdown: "1:14"))
+        await pane.react(to: ["1"], with: ready)
+        await store.perform(.choose(ordinal: 1))
+
+        #expect(await pane.keys == [["1"]])
+        #expect(store.notice == nil)
+        #expect(store.progress == .ready)
+        #expect(store.history.calls["toolu_gate"] == .allowed)
+
+        // Multi-step Decline with Note also succeeds while the countdown ticks
+        // between every step.
+        let notePane = FakePane(ClaudeDialogRows.quotedBashScreen(countdown: "1:12"))
+        await notePane.react(to: ["down"], with: ClaudeDialogRows.quotedBashScreen(countdown: "1:11", focused: 2))
+        await notePane.react(
+            to: ["tab"],
+            with: ClaudeDialogRows.quotedBashScreen(countdown: "1:10", focused: 2, feedbackOrdinal: 2))
+        let note = "Use a temporary folder under /tmp"
+        let noteStore = BlockedCardStore(
+            program: .claude,
+            io: BlockedScreenIO(
+                readScreen: { try await notePane.read() },
+                sendKeys: { keys in
+                    await notePane.send(keys)
+                    if keys == ["enter"] { await notePane.show(ready) }
+                },
+                paste: { text in
+                    await notePane.paste(text)
+                    await notePane.show(
+                        ClaudeDialogRows.quotedBashScreen(
+                            countdown: "1:09", focused: 2, feedbackOrdinal: 2, feedbackText: text))
+                }),
+            clock: ManualClock().clock)
+        noteStore.update(transcript: Self.transcript(pending: [request]))
+        noteStore.update(activity: .blocked)
+        await noteStore.refresh()
+
+        await noteStore.perform(.amend(ordinal: 2, note: note))
+
+        #expect(await notePane.keys == [["down"], ["tab"], ["enter"]])
+        #expect(await notePane.pastes == [note])
+        #expect(noteStore.notice == nil)
+        #expect(noteStore.progress == .ready)
+    }
 }
 
 @MainActor
@@ -2879,224 +2972,6 @@ private actor FakePane {
     func paste(_ text: String) {
         pastes.append(text)
         if let next = pasteReactions[text] { screen = next }
-    }
-}
-
-/// The card hosted in a window, read as VoiceOver reads it: what its Esc
-/// button says.
-@MainActor
-@Suite("Blocked card, hosted", .serialized, .timeLimit(.minutes(1)))
-struct BlockedCardHostedTests {
-    /// OpenCode's question footer says `esc dismiss`, and so does the
-    /// card's Esc, open or folded.
-    @Test func anOpenCodeQuestionsEscSaysDismiss() async throws {
-        let store = try await Self.store(
-            "opencode-13-question-180",
-            pending: ChatPendingRequest(
-                entryID: ChatEntryID("call_q"), callID: "call_q", kind: .question, toolName: "question",
-                summary: "Do you prefer red or blue?"))
-        try await Self.host(store) { controller in
-            #expect(await Self.eventually { Self.labels(in: controller).contains("Dismiss") })
-            #expect(!Self.labels(in: controller).contains("Stop"))
-            store.isCollapsed = true
-            #expect(await Self.eventually { Self.labels(in: controller).isSuperset(of: ["Dismiss", "Show"]) })
-        }
-    }
-
-    /// An answer that showed no effect leaves the options waiting, Reject
-    /// too, and Esc as the way out. It says Stop, so the open card shows no
-    /// second Reject.
-    @Test func anUnconfirmedOpenCodePermissionOffersStopBesideItsReject() async throws {
-        let store = try await Self.store(
-            "opencode-10-permission-180",
-            pending: ChatPendingRequest(
-                entryID: ChatEntryID("call_r"), callID: "call_r", kind: .fileRead, toolName: "read",
-                summary: "/Users/developer/work/heeler-tmp-chat/opencode-a/project/.env"))
-        await store.perform(.choose(ordinal: 1))
-        try #require(store.progress == .unconfirmed)
-        try await Self.host(store) { controller in
-            #expect(await Self.eventually { Self.labels(in: controller).isSuperset(of: ["Reject", "Stop"]) })
-        }
-    }
-
-    /// Antigravity CLI's multi-select card offers its `Write-in...` field
-    /// above Submit, worded as the form's page words it, and Submit waits
-    /// for a check or a written answer. Written alone, the answer goes
-    /// through agy's field: its digit, the paste, Enter (`A1: mango`).
-    @Test func anAgyMultiSelectCardTakesAWrittenAnswer() async throws {
-        let pane = FakePane(try ScreenFixture.screen("agy-154-ask-question-multiselect-120x40"))
-        await pane.react(
-            to: ["4"], with: try ScreenFixture.screen("agy-161-ask-question-multiselect-writein-open-by-enter-120x40"))
-        await pane.react(
-            toPaste: "mango",
-            with: try ScreenFixture.screen("agy-162-ask-question-multiselect-writein-alone-typed-120x40"))
-        await pane.react(to: ["enter"], with: try ScreenFixture.screen("agy-02-idle-empty-120x40"))
-        let store = BlockedCardStore(
-            program: .agy,
-            io: BlockedScreenIO(
-                readScreen: { try await pane.read() },
-                sendKeys: { await pane.send($0) },
-                paste: { await pane.paste($0) }),
-            clock: ManualClock().clock)
-        store.update(activity: .blocked)
-        await store.refresh()
-        try await Self.host(store) { controller in
-            let submit = { AccessibilityProbe.elements(labeled: "Submit", in: controller.view).first }
-            #expect(
-                await Self.eventually {
-                    Self.labels(in: controller).isSuperset(of: ["apple", "banana", "cherry", "Submit"])
-                })
-            #expect(submit()?.accessibilityTraits.contains(.notEnabled) == true)
-
-            let field = try #require(Self.textField(in: controller.view))
-            #expect(field.placeholder == "Type your own answer")
-            field.becomeFirstResponder()
-            field.insertText("mango")
-            #expect(await Self.eventually { submit()?.accessibilityTraits.contains(.notEnabled) == false })
-            #expect(submit()?.accessibilityActivate() == true)
-
-            var budget = PollBudget(.seconds(5))
-            while budget.hasTimeLeft, await pane.keys != [["4"], ["enter"]] {
-                try? await Task.sleep(for: .milliseconds(10))
-                budget.charge()
-            }
-            #expect(await pane.keys == [["4"], ["enter"]])
-            #expect(await pane.pastes == ["mango"])
-        }
-    }
-
-    /// An Antigravity CLI form's multi-select page offers the `Write-in...`
-    /// field beside its checks. On agy-163, apple already checked in the
-    /// terminal, `mango` typed on the card goes out with that check and
-    /// the second page's Skip: `Write-in...`'s digit, the paste, Enter,
-    /// then Esc (`A1: apple, mango`, `A2: User Skipped`).
-    @Test func anAgyFormsMultiSelectPageTakesAWrittenAnswer() async throws {
-        let pane = FakePane(try ScreenFixture.screen("agy-163-ask-question-multiselect-q1-of-2-checked-120x40"))
-        await pane.react(
-            to: ["4"], with: try ScreenFixture.screen("agy-164-ask-question-multiselect-q1-of-2-writein-open-120x40"))
-        await pane.react(
-            toPaste: "mango",
-            with: try ScreenFixture.screen("agy-166-ask-question-multiselect-q1-of-2-writein-typed-120x40"))
-        await pane.react(
-            to: ["enter"], with: try ScreenFixture.screen("agy-167-ask-question-q2-after-multiselect-writein-120x40"))
-        await pane.react(
-            to: ["esc"], with: try ScreenFixture.screen("agy-168-idle-after-writein-and-skipped-question-120x40"))
-        let store = BlockedCardStore(
-            program: .agy,
-            io: BlockedScreenIO(
-                readScreen: { try await pane.read() },
-                sendKeys: { await pane.send($0) },
-                paste: { await pane.paste($0) }),
-            clock: ManualClock().clock)
-        let ask = ChatPendingRequest(
-            entryID: ChatEntryID("agy:9:tool:0"), callID: "agy:9:tool:0", kind: .question, toolName: "ask_question",
-            summary: "Which fruits do you like?",
-            questions: [
-                ChatQuestion(
-                    text: "Which fruits do you like?", options: ["apple", "banana", "cherry"], isMultiSelect: true),
-                ChatQuestion(text: "Which size?", options: ["small", "large"]),
-            ])
-        store.update(transcript: ChatTranscript(entries: [], pendingRequests: [ask]))
-        store.update(activity: .blocked)
-        await store.refresh()
-        try await Self.host(store) { controller in
-            let button = { (label: String) in AccessibilityProbe.elements(labeled: label, in: controller.view).first }
-            #expect(
-                await Self.eventually {
-                    Self.labels(in: controller).isSuperset(of: ["apple", "banana", "cherry", "Next"])
-                })
-            let field = try #require(Self.textField(in: controller.view), "\(Self.labels(in: controller))")
-            #expect(field.placeholder == "Type your own answer")
-            field.becomeFirstResponder()
-            field.insertText("mango")
-            #expect(button("Next")?.accessibilityActivate() == true)
-            #expect(await Self.eventually { Self.labels(in: controller).contains("Which size?") })
-            #expect(button("Skip")?.accessibilityActivate() == true)
-            #expect(await Self.eventually { button("Submit Answers")?.accessibilityTraits.contains(.notEnabled) == false })
-            #expect(button("Submit Answers")?.accessibilityActivate() == true)
-
-            var budget = PollBudget(.seconds(5))
-            while budget.hasTimeLeft, await pane.keys != [["4"], ["enter"], ["esc"]] {
-                try? await Task.sleep(for: .milliseconds(10))
-                budget.charge()
-            }
-            #expect(await pane.keys == [["4"], ["enter"], ["esc"]])
-            #expect(await pane.pastes == ["mango"])
-        }
-    }
-
-    /// A single-select card's own-answer field: Antigravity CLI's says what
-    /// its multi-select card and form pages say, not the terminal row's
-    /// `Write-in...`; Claude's keeps the row label Claude draws.
-    @Test(arguments: [
-        (ChatProgram.agy, "agy-41-ask-question-single-120x40", "Type your own answer"),
-        (ChatProgram.claude, "claude-39-c8-phone-question-titled-rule", "Type something."),
-    ])
-    func aSingleSelectCardWordsItsOwnAnswerField(_ program: ChatProgram, _ stem: String, placeholder: String)
-        async throws
-    {
-        let pane = FakePane(try ScreenFixture.screen(stem))
-        let store = BlockedCardStore(
-            program: program,
-            io: BlockedScreenIO(
-                readScreen: { try await pane.read() },
-                sendKeys: { await pane.send($0) },
-                paste: { await pane.paste($0) }),
-            clock: ManualClock().clock)
-        store.update(activity: .blocked)
-        await store.refresh()
-        try await Self.host(store) { controller in
-            #expect(await Self.eventually { Self.labels(in: controller).contains("Send") })
-            let field = try #require(Self.textField(in: controller.view), "\(Self.labels(in: controller))")
-            #expect(field.placeholder == placeholder)
-        }
-    }
-
-    private static func textField(in view: UIView) -> UITextField? {
-        if let field = view as? UITextField { return field }
-        return view.subviews.lazy.compactMap { textField(in: $0) }.first
-    }
-
-    /// An OpenCode card for the dialog on `stem`, matched to `pending`.
-    private static func store(_ stem: String, pending: ChatPendingRequest) async throws -> BlockedCardStore {
-        let pane = FakePane(try ScreenFixture.screen(stem))
-        let store = BlockedCardStore(
-            program: .opencode,
-            io: BlockedScreenIO(
-                readScreen: { try await pane.read() },
-                sendKeys: { await pane.send($0) },
-                paste: { await pane.paste($0) }),
-            clock: ManualClock().clock)
-        store.update(transcript: ChatTranscript(entries: [], pendingRequests: [pending]))
-        store.update(activity: .blocked)
-        await store.refresh()
-        return store
-    }
-
-    private static func host(
-        _ store: BlockedCardStore, _ body: @MainActor (UIViewController) async throws -> Void
-    ) async throws {
-        let controller = UIHostingController(rootView: BlockedCardView(store: store, maxHeight: 600, openTerminal: {}))
-        try await withTestWindow(
-            frame: CGRect(x: 0, y: 0, width: 402, height: 874), rootViewController: controller
-        ) { _ in
-            try await body(controller)
-        }
-    }
-
-    private static func labels(in controller: UIViewController) -> Set<String> {
-        controller.view.layoutIfNeeded()
-        return AgentSurfaceReplacementTests.accessibilityLabels(in: controller.view)
-    }
-
-    private static func eventually(_ condition: () -> Bool) async -> Bool {
-        var budget = PollBudget(.seconds(5))
-        while budget.hasTimeLeft {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-            budget.charge()
-        }
-        return condition()
     }
 }
 

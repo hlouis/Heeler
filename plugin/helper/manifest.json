@@ -1,5 +1,5 @@
 {
-  "version": "0.5.10",
+  "version": "0.5.12",
   "files": [
     {
       "path": "core/agent-rule.js",
@@ -99,7 +99,7 @@
     },
     {
       "path": "shared/delivery/registrations.js",
-      "sha256": "6eb37ff3d81cc6ae17292e76405ac77406adc7a54b499be412df960be6914dba"
+      "sha256": "4196325a92b39377ab1db4f6d58f301b712e3bd131b93471cc3fd479f32040fb"
     },
     {
       "path": "shared/display-text.js",
@@ -187,7 +187,7 @@
     },
     {
       "path": "shared/usage/pricing.json",
-      "sha256": "132d33eb2a28919b7da995fcf1fbdd0799130cc9c09004f7eedac16855701b85"
+      "sha256": "0a5539718e0a529f859f26709330783f4cb38d81737af9ab8545a2f4eed2430e"
     },
     {
       "path": "shared/usage/process-environment.js",
@@ -215,7 +215,7 @@
     },
     {
       "path": "tmux/follower.js",
-      "sha256": "e443d5bc29c787e12759d93f9c76f00d163db9c0ecc9dbeebb07339228117d87"
+      "sha256": "14cb2112ec6f3afdf476434749c3dfed44359c778cfbf317c43d5587291e15fc"
     },
     {
       "path": "tmux/foreground.js",
@@ -235,7 +235,7 @@
     },
     {
       "path": "tmux/quoted-format.js",
-      "sha256": "c1521205d9448609c1c7643875c28695184060a555bcb290ddf2b626059a1c5b"
+      "sha256": "e40fcf4fc47da1a00b4c5e1385bf88be2b17dbf3dff019f24728691d3889cbed"
     },
     {
       "path": "tmux/socket-name.js",
@@ -279,7 +279,7 @@
     },
     {
       "path": "version.json",
-      "sha256": "a3c972c715fe7a91151cdbe5b624e5bf618fc70284b38d6e08a60e5d25798dd3"
+      "sha256": "ea71edc51f9955ddb9e2e56407f1680b32c253f79e84fba55a9e671d624a59dd"
     }
   ]
 }

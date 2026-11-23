@@ -4,7 +4,7 @@
 
 # Heeler
 
-<a href="https://apps.apple.com/us/app/heeler-for-herdr/id6797263135"><img src="https://toolbox.marketingtools.apple.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="從 App Store 下載" height="40" /></a>
+<a href="https://apps.apple.com/us/app/id6797263135"><img src="https://toolbox.marketingtools.apple.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="從 App Store 下載" height="40" /></a>
 <a href="https://testflight.apple.com/join/aXSxRn4r"><img src="docs/images/testflight-badge.svg" alt="可在 TestFlight 取得" height="40" /></a>
 
 **在 iPhone 和 iPad 上掌控你自己機器上執行的寫程式 Agent。**
@@ -16,7 +16,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-6F42C1?style=flat-square)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white&style=flat-square)](https://www.swift.org)
 [![iOS](https://img.shields.io/badge/iOS-18%2B-000000?logo=apple&logoColor=white&style=flat-square)](https://developer.apple.com/ios/)
-[![App Store](https://img.shields.io/badge/App_Store-available-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135)
+[![App Store](https://img.shields.io/badge/App_Store-available-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://apps.apple.com/us/app/id6797263135)
 
 <a href="https://trendshift.io/repositories/151670?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-151670" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/151670" alt="ZingerLittleBee%2FHeeler | Trendshift" width="250" height="55"/></a>
 
@@ -65,12 +65,12 @@ Heeler 是 iPhone 和 iPad 上獨立、開源的 Agent 主控台，也是一款 
 - **通知與即時動態**：Agent 受阻或完成時收到端對端加密的推播，鎖定畫面與動態島即時顯示 Agent。中繼伺服器無法讀取內容。[隱私權說明](PRIVACY.md)
 - **用量**：Claude Code 與 Codex 的用量上限及重設時間、最多 30 天的 Token 用量與預估 API 費用，以及主畫面與鎖定畫面小工具。[用量指南](https://docs.heeler.bybee.dev/usage)
 - **輸入框**：用完整的 iOS 鍵盤或語音撰寫草稿，再一次傳送。工具鍵盤提供 Agent 控制鍵、技能與片語，還能附上照片或最大 64 MiB 的檔案。[語音輸入指南](https://docs.heeler.bybee.dev/voice-input)
-- **隨處連線**：內建 Tailscale、ZeroTier 與 EasyTier，手機不必安裝 VPN App。無法直接連通的機器可透過跳板主機連線，一台主機可以有多條路由。[覆蓋網路](https://docs.heeler.bybee.dev/overlay-networks) · [跳板主機](https://docs.heeler.bybee.dev/vps-jump-host-setup) · [多條路由](https://docs.heeler.bybee.dev/host-routes)
+- **隨處連線**：內建 Tailscale、ZeroTier、EasyTier 與 tailcat，手機不必安裝 VPN App。無法直接連通的機器可透過跳板主機連線，一台主機可以有多條路由。[覆蓋網路](https://docs.heeler.bybee.dev/overlay-networks) · [跳板主機](https://docs.heeler.bybee.dev/vps-jump-host-setup) · [多條路由](https://docs.heeler.bybee.dev/host-routes)
 - **其他**：QR 配對、工作樹、檢視已暫存與未暫存檔案的變更頁面、30 種佈景主題，以及支援 Magic Keyboard 快速鍵、多視窗與拖放的 iPad 版。
 
 ## 安裝
 
-從 [App Store](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135) 或 [TestFlight](https://testflight.apple.com/join/aXSxRn4r) 安裝 Heeler。機器上需要啟用 SSH，並執行下列任一種後端：
+從 [App Store](https://apps.apple.com/us/app/id6797263135) 或 [TestFlight](https://testflight.apple.com/join/aXSxRn4r) 安裝 Heeler。機器上需要啟用 SSH，並執行下列任一種後端：
 
 | 後端 | 執行平台 | 指南 |
 | --- | --- | --- |
@@ -95,7 +95,7 @@ herdr plugin action invoke heeler.pair
 
 **或者輸入位址。** 適用於所有後端。在**主機**分頁點一下 **+**，輸入位址和 SSH 使用者，Heeler 會列出這台機器上執行的 Herdr TUI、herdr-core、每個 tmux 伺服器和 Rex。一台主機可以同時使用其中多個。[連線到 herdr-core](https://docs.heeler.bybee.dev/herdr-core) · [連線到 tmux](https://docs.heeler.bybee.dev/tmux) · [連線到 Rex](https://docs.heeler.bybee.dev/rex) · [Windows 設定](https://docs.heeler.bybee.dev/windows-setup)
 
-**不在同一個網路時。** 透過內建的[覆蓋網路](https://docs.heeler.bybee.dev/overlay-networks)（[Tailscale](https://docs.heeler.bybee.dev/tailscale)、[ZeroTier](https://docs.heeler.bybee.dev/zerotier)、[EasyTier](https://docs.heeler.bybee.dev/easytier)）、[跳板主機](https://docs.heeler.bybee.dev/vps-jump-host-setup)或 [Cloudflare Tunnel](https://docs.heeler.bybee.dev/cloudflare-tunnel) 連線，並為主機設定[多條路由](https://docs.heeler.bybee.dev/host-routes)，在家或在外都能連上。
+**不在同一個網路時。** 透過內建的[覆蓋網路](https://docs.heeler.bybee.dev/overlay-networks)（[Tailscale](https://docs.heeler.bybee.dev/tailscale)、[ZeroTier](https://docs.heeler.bybee.dev/zerotier)、[EasyTier](https://docs.heeler.bybee.dev/easytier)、[tailcat](https://docs.heeler.bybee.dev/tailcat)）、[跳板主機](https://docs.heeler.bybee.dev/vps-jump-host-setup)或 [Cloudflare Tunnel](https://docs.heeler.bybee.dev/cloudflare-tunnel) 連線，並為主機設定[多條路由](https://docs.heeler.bybee.dev/host-routes)，在家或在外都能連上。
 
 ## 連線方式
 
@@ -124,7 +124,7 @@ Heeler 以 SwiftUI 開發，支援 iOS 18+；SSH 使用存放庫內的 `Packages
 
 ## 狀態
 
-已在 [App Store](https://apps.apple.com/us/app/heeler-for-herdr/id6797263135) 上架。
+已在 [App Store](https://apps.apple.com/us/app/id6797263135) 上架。
 尚未在所有國家或地區提供；在尚未上架的地區，仍可使用
 [TestFlight](https://testflight.apple.com/join/aXSxRn4r) 版本。
 本專案以自用為出發點，並在日常使用中逐步成形，因此可能還有不夠完善之處，

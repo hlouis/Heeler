@@ -15,6 +15,14 @@ enum HerdrCoreAttach {
         let (_, stream) = try await link.openStream(
             "terminal.attach", params: try params(for: request), deadline: deadline,
             creditsWhenConsumed: true)
+        let firstPaint = HerdrCoreFirstPaintHold()
+        let reprint = HerdrCoreReprintHold(
+            expecting: request.reprint,
+            read: {
+                try await firstPaint.next(
+                    read: { try await stream.read() }, credit: { await stream.consumed($0) })
+            },
+            credit: { await stream.consumed($0) })
         let input = TerminalAttachInputQueue()
         let pump = Task {
             // A write fails only once the channel or the link has ended, which
@@ -23,6 +31,8 @@ enum HerdrCoreAttach {
                 write: { try await stream.write($0) },
                 resize: { columns, rows in
                     guard Self.isValidGeometry(columns: columns, rows: rows) else { return }
+                    // Ahead of the resize, so what it brings finds the hold ready.
+                    reprint.resized()
                     try await stream.resize(columns: columns, rows: rows)
                 })
         }
@@ -32,12 +42,11 @@ enum HerdrCoreAttach {
                 do { try await Self.send(change, on: stream) } catch { return }
             }
         }
-        let firstPaint = HerdrCoreFirstPaintHold()
         return TerminalAttachSession(
-            output: { Self.output(of: stream, holding: firstPaint) },
+            output: { Self.output(holding: reprint) },
             input: input,
             onConsumed: { count in
-                let owed = firstPaint.consumed(count)
+                let owed = reprint.consumed(firstPaint.consumed(count))
                 guard owed > 0 else { return }
                 Task { await stream.consumed(owed) }
             },
@@ -115,14 +124,12 @@ enum HerdrCoreAttach {
 
     /// A store reattaches after a lost connection, which any failure of the
     /// link comes to: a core restart reopens it on the same SSH connection.
-    /// The first paint comes out whole (`HerdrCoreFirstPaintHold`).
-    private static func output(
-        of stream: HerdrCoreLinkStream, holding firstPaint: HerdrCoreFirstPaintHold
-    ) -> AsyncThrowingStream<Data, any Error> {
+    /// The first paint comes out whole (`HerdrCoreFirstPaintHold`), and so does
+    /// a program's reprint of its history after it (`HerdrCoreReprintHold`).
+    private static func output(holding reprint: HerdrCoreReprintHold) -> AsyncThrowingStream<Data, any Error> {
         AsyncThrowingStream {
             do {
-                return try await firstPaint.next(
-                    read: { try await stream.read() }, credit: { await stream.consumed($0) })
+                return try await reprint.next()
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

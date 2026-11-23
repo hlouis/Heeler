@@ -1,7 +1,6 @@
 import Foundation
 import SwiftUI
 import Testing
-import UIKit
 
 @testable import Heeler
 
@@ -603,149 +602,229 @@ struct AgySwarmTests {
         #expect(snap3.boardPosts.last?.isMarkedDone == true)
     }
 
-    @MainActor
-    @Test func largeSwarmBoardRecyclesCellsAndSkipsRebuildsDuringWorkerPolls() async throws {
-        let roster = try #require(
-            AgySwarmParser.parseRoster(
-                Data(
-                    """
-                    {
-                      "title": "MuseDAM Design Swarm",
-                      "members": {
-                        "coordinator": { "conversation_id": "\(Self.coordinatorID)", "role": "coordinator", "wake_mode": "anything" },
-                        "verifier": { "conversation_id": "\(Self.workerAID)", "role": "worker", "wake_mode": "mentions" }
-                      }
-                    }
-                    """.utf8)))
+    // MARK: - Compact Directory & Post Detail Presentation
 
-        let rawLines: [AgySwarmParser.RawBoardLine] = (1...120).compactMap { seq in
-            let isBrief = seq % 15 == 1
-            let body: String
-            if isBrief {
-                body = (1...10).map { "@verifier line \($0): audit `MaterialRPCEnterpriseOpenServiceImpl.java`." }
-                    .joined(separator: "\n")
-            } else {
-                body = """
-                    @coordinator Follow-up to #\(max(1, seq - 1)):
-                    - **Actual Repo Convention (\(seq))**:
-                      1. Add `@SentinelResource(value = "enterprise-query-\(seq)")` on `OpenEnterpriseCallController.java:36`.
-                      2. Configure QPS FlowRule catching `FlowException` -> `"429"` 请求太过频繁.
+    @Test func boardMessageComputesLineCountAndCompactPreviewThresholds() {
+        let shortSingle = AgySwarmSnapshot.BoardMessage(
+            seq: 1, agent: "worker-a", text: "确认一下：CAP_TAILSCALE 用 bit 11 对吗？",
+            time: "2026-11-21 18:38:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(shortSingle.lineCount == 1)
+        #expect(!shortSingle.isLongPost)
 
-                    | Endpoint | Status | Notes |
-                    | --- | --- | --- |
-                    | `/enterprise/open/\(seq)` | Ready | Verified against `#\(max(1, seq - 1))` |
-                    """
+        let shortTwoLines = AgySwarmSnapshot.BoardMessage(
+            seq: 2, agent: "coordinator", text: "收到。\n请同步更新文档。\n",
+            time: "2026-11-21 18:39:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(shortTwoLines.lineCount == 2)
+        #expect(!shortTwoLines.isLongPost)
+
+        let threeLineList = AgySwarmSnapshot.BoardMessage(
+            seq: 3, agent: "worker-a", text: "- item 1\n- item 2\n- item 3",
+            time: "2026-11-21 18:40:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(threeLineList.lineCount == 3)
+        #expect(threeLineList.isLongPost)
+
+        let longSingleLine = AgySwarmSnapshot.BoardMessage(
+            seq: 4, agent: "worker-a",
+            text: String(repeating: "a", count: 140),
+            time: "2026-11-21 18:41:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(longSingleLine.lineCount == 1)
+        #expect(longSingleLine.isLongPost)
+
+        let fencedCode = AgySwarmSnapshot.BoardMessage(
+            seq: 5, agent: "worker-a", text: "```sh\nls\n```",
+            time: "2026-11-21 18:42:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(fencedCode.isLongPost)
+
+        let empty = AgySwarmSnapshot.BoardMessage(
+            seq: 6, agent: "worker-a", text: "",
+            time: "2026-11-21 18:43:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        #expect(empty.lineCount == 0)
+        #expect(!empty.isLongPost)
+    }
+
+    @Test func boardFilterOptionsAndMatchingCoverChannelsStatusAndAuthors() throws {
+        let rosterJSON = """
+            {
+              "title": "Tailscale Support",
+              "members": {
+                "coordinator": { "conversation_id": "\(Self.coordinatorID)", "role": "coordinator", "wake_mode": "anything" },
+                "backend-worker": { "conversation_id": "\(Self.workerAID)", "role": "worker", "wake_mode": "mentions" },
+                "docs-worker": { "conversation_id": "\(Self.workerBID)", "role": "worker" }
+              }
             }
-            let escaped = body
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-                .replacingOccurrences(of: "\n", with: "\\n")
-            let kindField = isBrief ? #","kind":"brief""# : ""
-            return AgySwarmParser.parseBoardLine(
-                Self.line(
-                    #"{"seq":\#(seq),"agent":"verifier","text":"\#(escaped)","time":"2026-11-18 12:04:00"\#(kindField)}"#))
-        }
-        #expect(rawLines.count == 120)
-
-        var workerTr = AgySwarmMemberTranscript()
-        workerTr.modificationDate = Self.baseDate
-        workerTr.apply([
-            Self.line(
-                #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"\"/repo/Service.java\""}}]}"#
-            ),
-        ])
+            """
+        let roster = try #require(AgySwarmParser.parseRoster(Data(rosterJSON.utf8)))
+        let rawLines = [
+            #"{"seq":1,"agent":"coordinator","kind":"brief","text":"@backend-worker Implement Tailscale socket support."}"#,
+            #"{"seq":2,"agent":"coordinator","text":"opened #docs","control":{"op":"create","channel":"docs","topic":"Bilingual guides","members":["docs-worker"]}}"#,
+            #"{"seq":3,"agent":"backend-worker","text":"@coordinator [done] Socket auth implemented."}"#,
+            #"{"seq":4,"agent":"docs-worker","channel":"docs","text":"@coordinator [stall] Waiting on env var list."}"#,
+        ].compactMap { AgySwarmParser.parseBoardLine(Self.line($0)) }
 
         let snapshot = AgySwarmParser.buildSnapshot(
             id: Self.coordinatorID,
             roster: roster,
             rawLines: rawLines,
-            transcripts: ["verifier": workerTr],
+            transcripts: [:],
             overview: nil,
             isLive: true,
             now: Self.baseDate)
 
-        let boardModel = ChatSwarmBoardModel()
-        boardModel.warm(swarm: snapshot)
-        await boardModel.settled()
+        let options = ChatSwarmBoardFilter.options(in: snapshot)
+        #expect(
+            options.map(\.filter) == [
+                .all,
+                .channel("main"),
+                .channel("docs"),
+                .done,
+                .stall,
+                .author("coordinator"),
+                .author("docs-worker"),
+                .author("backend-worker"),
+            ])
+        #expect(options.first(where: { $0.filter == .done })?.count == 1)
+        #expect(options.first(where: { $0.filter == .stall })?.count == 1)
 
-        let controller = ChatSwarmListController<Int, ChatSwarmBoardRow, ChatSwarmBoardCard>(
-            accessibilityIdentifier: "chat.swarm.board.list"
-        ) { item in
-            ChatSwarmBoardCard(row: item.payload, toggleExpand: {}, jumpToSeq: { _ in })
+        #expect(snapshot.boardPosts.filter { ChatSwarmBoardFilter.done.matches($0) }.map(\.seq) == [3])
+        #expect(snapshot.boardPosts.filter { ChatSwarmBoardFilter.stall.matches($0) }.map(\.seq) == [4])
+        #expect(snapshot.boardPosts.filter { ChatSwarmBoardFilter.channel("docs").matches($0) }.map(\.seq) == [4])
+        #expect(snapshot.boardPosts.filter { ChatSwarmBoardFilter.author("backend-worker").matches($0) }.map(\.seq) == [3])
+    }
+
+    @MainActor
+    @Test func boardModelBuildsCompactDirectoryRowsAndParsesDetailBlocksOnDemand() async {
+        let shortPost = AgySwarmSnapshot.BoardMessage(
+            seq: 1, agent: "coordinator", text: "Short question?",
+            time: "2026-11-21 18:40:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        let citedShortPost = AgySwarmSnapshot.BoardMessage(
+            seq: 2, agent: "worker-a", text: "See #1 for context.",
+            time: "2026-11-21 18:41:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+        let longPost = AgySwarmSnapshot.BoardMessage(
+            seq: 3, agent: "worker-b", text: "- Line 1\n- Line 2\n- Line 3\n- Line 4",
+            time: "2026-11-21 18:42:00", timestamp: nil, channel: "main",
+            isBrief: false, isControl: false, mentions: [], channelMentions: [], mentionsAll: false)
+
+        let model = ChatSwarmBoardModel()
+        let state = model.buildState(
+            swarmID: Self.coordinatorID,
+            filter: .all,
+            posts: [shortPost, citedShortPost, longPost],
+            knownSeqs: [1, 2, 3],
+            highlightedSeq: 3)
+
+        #expect(state.items.count == 3)
+        #expect(state.items[0].payload.isFirst)
+        #expect(!state.items[0].payload.isLast)
+        #expect(!state.items[0].payload.opensDetail)
+
+        #expect(!state.items[1].payload.isFirst)
+        #expect(!state.items[1].payload.isLast)
+        #expect(state.items[1].payload.opensDetail)
+        #expect(state.items[1].payload.citedSeqs == [1])
+
+        #expect(!state.items[2].payload.isFirst)
+        #expect(state.items[2].payload.isLast)
+        #expect(state.items[2].payload.opensDetail)
+        #expect(state.items[2].payload.isHighlighted)
+
+        #expect(model.parsedBlocks(for: 3, text: longPost.text) == nil)
+        model.ensureBlocks(swarmID: Self.coordinatorID, posts: [longPost])
+        await model.settled()
+        #expect(model.parsedBlocks(for: 3, text: longPost.text)?.isEmpty == false)
+    }
+
+    @MainActor
+    @Test func workerModelCollapsesLongRepliesAndParsesMarkdownOnlyWhenExpanded() async {
+        let shortReply = ChatEntry(
+            id: ChatEntryID("short-assistant"),
+            sourceOffset: 100,
+            content: .assistant(ChatAssistantMessage(text: "Done in 2 lines.\nTests pass.")))
+        let longText = (1...12).map { "- Changed module \($0)" }.joined(separator: "\n")
+        let longReply = ChatEntry(
+            id: ChatEntryID("long-assistant"),
+            sourceOffset: 200,
+            content: .assistant(ChatAssistantMessage(text: longText)))
+        let longUser = ChatEntry(
+            id: ChatEntryID("long-user"),
+            sourceOffset: 0,
+            content: .user(ChatUserMessage(text: (1...8).map { "Line \($0)" }.joined(separator: "\n"))))
+
+        let entries = [longUser, shortReply, longReply]
+        let model = ChatSwarmWorkerModel()
+        model.ensureBlocks(
+            memberName: "docs-worker",
+            assignment: nil,
+            isAssignmentExpanded: false,
+            entries: entries,
+            expandedEntries: [])
+        await model.settled()
+
+        let collapsedState = model.buildState(
+            memberName: "docs-worker",
+            member: nil,
+            assignment: nil,
+            isAssignmentExpanded: false,
+            isLoading: false,
+            failureMessage: nil,
+            entries: entries,
+            expandedEntries: [])
+
+        #expect(collapsedState.items.count == 3)
+        if case .entry(_, let isCollapsible, let lines, let isExpanded, _) = collapsedState.items[0].payload {
+            #expect(isCollapsible)
+            #expect(lines == 8)
+            #expect(!isExpanded)
+        } else {
+            Issue.record("Expected long user entry")
+        }
+        if case .entry(_, let isCollapsible, _, _, let blocks) = collapsedState.items[1].payload {
+            #expect(!isCollapsible)
+            #expect(blocks?.isEmpty == false)
+        } else {
+            Issue.record("Expected short assistant entry")
+        }
+        if case .entry(_, let isCollapsible, let lines, let isExpanded, let blocks) = collapsedState.items[2].payload {
+            #expect(isCollapsible)
+            #expect(lines == 12)
+            #expect(!isExpanded)
+            #expect(blocks == nil)
+        } else {
+            Issue.record("Expected collapsed long assistant entry")
         }
 
-        let frame = CGRect(x: 0, y: 0, width: 393, height: 680)
-        try await withTestWindow(frame: frame, rootViewController: controller) { _ in
-            let initialState = boardModel.buildState(
-                swarmID: snapshot.id,
-                channel: nil,
-                posts: snapshot.boardPosts,
-                knownSeqs: snapshot.knownPostSeqs,
-                expandedBriefs: [],
-                highlightedSeq: nil)
-            controller.apply(initialState)
-            controller.timeline.layoutIfNeeded()
-            try await Task.sleep(for: .milliseconds(40))
-            controller.timeline.layoutIfNeeded()
+        // Expanding the long reply triggers off-main-actor Markdown parsing.
+        let expanded: Set<ChatEntryID> = [longReply.id]
+        model.ensureBlocks(
+            memberName: "docs-worker",
+            assignment: nil,
+            isAssignmentExpanded: false,
+            entries: entries,
+            expandedEntries: expanded)
+        await model.settled()
 
-            // Opened pinned to the newest post (#120) while realizing only a few visible cells!
-            #expect(controller.visibleItemIDs.contains(120))
-            #expect(controller.timeline.visibleCells.count < 10)
-            let buildsAfterInitial = controller.cellBuilds
-
-            // Simulate 10 consecutive 1-second worker step/activity updates with NO new board posts:
-            // ZERO cells on the Board may rebuild!
-            for step in 2...11 {
-                workerTr.apply([
-                    Self.line(
-                        #"{"step_index":\#(step),"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"\"/repo/File\#(step).java\""}}]}"#
-                    ),
-                ])
-                let ticked = AgySwarmParser.buildSnapshot(
-                    id: Self.coordinatorID,
-                    roster: roster,
-                    rawLines: rawLines,
-                    transcripts: ["verifier": workerTr],
-                    overview: nil,
-                    isLive: true,
-                    now: Self.baseDate.addingTimeInterval(Double(step)))
-                let nextState = boardModel.buildState(
-                    swarmID: ticked.id,
-                    channel: nil,
-                    posts: ticked.boardPosts,
-                    knownSeqs: ticked.knownPostSeqs,
-                    expandedBriefs: [],
-                    highlightedSeq: nil)
-                controller.apply(nextState)
-            }
-            #expect(controller.cellBuilds == buildsAfterInitial)
-
-            // Jump up to #45 in the middle of the 120-post board: offscreen cells recycle cleanly!
-            controller.scrollToItem(45, animated: false)
-            controller.timeline.layoutIfNeeded()
-            try await Task.sleep(for: .milliseconds(40))
-            controller.timeline.layoutIfNeeded()
-            #expect(controller.visibleItemIDs.contains(45))
-            #expect(!controller.isFollowing)
-
-            let view = controller.timeline
-            let recycledOffscreen = view.subviews
-                .compactMap { $0 as? UICollectionViewCell }
-                .filter { !view.visibleCells.contains($0) }
-            #expect(recycledOffscreen.allSatisfy { $0.contentConfiguration == nil })
-
-            // Highlighting #45 reconfigures ONLY that 1 cell, not the rest of the board!
-            let buildsBeforeHighlight = controller.cellBuilds
-            let highlightedState = boardModel.buildState(
-                swarmID: snapshot.id,
-                channel: nil,
-                posts: snapshot.boardPosts,
-                knownSeqs: snapshot.knownPostSeqs,
-                expandedBriefs: [],
-                highlightedSeq: 45)
-            controller.apply(highlightedState)
-            controller.timeline.layoutIfNeeded()
-            #expect(controller.cellBuilds == buildsBeforeHighlight + 1)
+        let expandedState = model.buildState(
+            memberName: "docs-worker",
+            member: nil,
+            assignment: nil,
+            isAssignmentExpanded: false,
+            isLoading: false,
+            failureMessage: nil,
+            entries: entries,
+            expandedEntries: expanded)
+        if case .entry(_, let isCollapsible, _, let isExpanded, let blocks) = expandedState.items[2].payload {
+            #expect(isCollapsible)
+            #expect(isExpanded)
+            #expect(blocks?.isEmpty == false)
+        } else {
+            Issue.record("Expected expanded long assistant entry")
         }
     }
 }
