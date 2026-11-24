@@ -419,6 +419,50 @@ struct ConsoleStoreTests {
         try await waitUntil("the connection is asked") { await transport.pingCount > pings }
     }
 
+    /// A network change wakes a Host waiting out reconnect backoff immediately
+    /// while leaving failed and suspended Hosts untouched.
+    @Test func aNetworkChangeWakesReconnectingHostsOutOfBackoff() async throws {
+        let reconnecting = Host.fixture(address: "reconnecting.example")
+        let failed = Host.fixture(address: "failed.example")
+        let recovered = ScriptedTransport()
+        let reconnectingQueue = ConnectionAttemptQueue([
+            .failure(.sshUnreachable(detail: "offline")),
+            .success(recovered),
+        ])
+        let failedQueue = ConnectionAttemptQueue([
+            .failure(.authenticationFailed),
+        ])
+        let store = ConsoleStore(
+            makeSession: { host, subscriptions in
+                let queue = host.id == reconnecting.id ? reconnectingQueue : failedQueue
+                return EventsSession(
+                    subscriptions: subscriptions,
+                    connect: { try await queue.next() },
+                    reconnectPolicy: ReconnectPolicy(
+                        initialDelay: .seconds(30), multiplier: 2, maxDelay: .seconds(60)),
+                    keepalive: nil)
+            })
+        store.setHosts([reconnecting, failed])
+        defer { store.setHosts([]) }
+        await store.resume()
+
+        try await waitUntil("reconnecting host enters backoff and failed host stops") {
+            guard case .reconnecting = store.hostStatuses[reconnecting.id],
+                case .failed = store.hostStatuses[failed.id]
+            else { return false }
+            return true
+        }
+
+        let started = ContinuousClock.now
+        await store.networkPathDidChange()
+
+        try await waitUntil("reconnecting host reconnects without waiting 30s backoff") {
+            store.hostStatuses[reconnecting.id] == EventsSessionStatus.connected
+        }
+        #expect(started.duration(to: .now) < .seconds(3))
+        #expect(await failedQueue.attemptCount == 1)
+    }
+
     @Test func aLaunchReadsTheCurrentAccountVariableAndRefusesAReadFailure() async throws {
         let host = Host.fixture()
         let transport = ScriptedTransport()
@@ -3682,6 +3726,22 @@ struct ConsoleStoreTests {
 
         #expect(!agentsInvalidated.withLock { $0 })
         #expect(!capabilitiesInvalidated.withLock { $0 })
+    }
+    @Test func projectionRebuildBurstCoalescesToOneRebuild() async throws {
+        let store = ConsoleStore(snapshotRetryDelay: .milliseconds(10))
+        let hosts = (0..<3).map {
+            Host(name: "host-\($0)", address: "10.0.0.\($0 + 1)", username: "dev", serverKind: .herdrCore)
+        }
+        store.setHosts(hosts)
+        defer { store.setHosts([]) }
+        let before = store.rebuildCountForTesting
+        for _ in 0..<50 {
+            store.requestRebuildForBench()
+        }
+        try await waitUntil("coalesced rebuild should run") {
+            store.rebuildCountForTesting > before
+        }
+        #expect(store.rebuildCountForTesting - before == 1)
     }
 }
 
