@@ -141,11 +141,20 @@ final class ConsoleStore {
     @ObservationIgnored private var agentStatusObservers: [
         ConsoleAgent.ID: [UUID: AsyncStream<AgentStatusUpdate>.Continuation]
     ] = [:]
+    @ObservationIgnored private var lastPublishedAgentStatuses: [
+        ConsoleAgent.ID: AgentStatusUpdate
+    ] = [:]
     @ObservationIgnored private var gitExecGates: [Host.ID: GitExecGate] = [:]
     /// The Agents list's Changes totals, one store per Agent, shared by
     /// every window's rows and by nothing else.
     @ObservationIgnored private(set) lazy var rowChanges = AgentRowChanges(
-        reads: { [unowned self] agent in capabilities(for: agent.hostID).rowsReadChanges }
+        reads: { [unowned self] agent in capabilities(for: agent.hostID).rowsReadChanges },
+        defersForForegroundLoad: { [weak self] hostID in
+            self?.hasForegroundChatInitialLoad(on: hostID) == true
+        },
+        yieldToForegroundLoad: { [weak self] hostID in
+            await self?.yieldToForegroundChatLoad(on: hostID)
+        }
     ) { [unowned self] agent in
         let store = makeChangesStore(
             agentID: agent.id, hostID: agent.hostID, openingDirectory: agent.directory)
@@ -215,6 +224,7 @@ final class ConsoleStore {
     /// the same turn, so the store lives here rather than only on the view.
     let pins: PinnedAgentsStore
     let rowLayouts: AgentRowLayoutStore
+    @ObservationIgnored let dismissedLaunchNotices: ChatLaunchNoticeDismissalStore
     let sidebarSnapshots = HerdrSidebarSnapshotStore()
     let pluginStatuses = HeelerPluginStatusStore()
     /// Made on demand while a view reads them, so not observed: each store
@@ -233,6 +243,11 @@ final class ConsoleStore {
     /// one: demo mode and tests must not replace the real widgets' figures.
     @ObservationIgnored let usageWidgets: AgentUsageWidgetPublisher?
     @ObservationIgnored private let usageSettings: AgentUsageSettings
+    /// The GitHub tab's lists (ADR 0065).
+    let gitHub: GitHubStore
+    /// The connection on which each record's gh last needed the macOS
+    /// desktop session, by its transport generation.
+    @ObservationIgnored private var gitHubDesktopRoutes: [Host.ID: UInt64] = [:]
     /// Reads made only because a widget's figures went stale, per Host.
     @ObservationIgnored private var widgetUsageRefreshes: [Host.ID: (id: UUID, task: Task<Void, Never>)] = [:]
     /// The catalog in its order, which the widgets' snapshot keeps.
@@ -243,12 +258,19 @@ final class ConsoleStore {
     /// cache: demo mode and tests build Console stores in the app's own
     /// container, and their `setHosts` would otherwise clear the real one.
     @ObservationIgnored let chatCache: any ChatTranscriptCache
+    /// Whole Host files Files and Chat's previews read, kept to open again.
+    /// A temporary one unless the app passes the real one, as `chatCache`.
+    @ObservationIgnored let hostFileCache: HostFileCache
     let cachedChats: ConsoleChatCache
     @ObservationIgnored private var chatPrefetchTasks: [Host.ID: Task<Void, Never>] = [:]
     @ObservationIgnored private var chatPrefetchActiveAgent: [Host.ID: ConsoleAgent.ID] = [:]
     @ObservationIgnored private var chatPrefetched: [ConsoleAgent.ID: String] = [:]
     /// Prefetches that found no conversation yet, by the key they ran for.
     @ObservationIgnored private var chatPrefetchRetries: [ConsoleAgent.ID: (key: String, count: Int)] = [:]
+    /// Status recorded when a prefetch finished without reaching `.following`,
+    /// so a status transition on a brand-new or missing session re-arms prefetch
+    /// without re-prefetching already-followed conversations on status flips.
+    @ObservationIgnored private var chatPrefetchAwaitingTurnStatus: [ConsoleAgent.ID: AgentStatus] = [:]
     /// The connection whose saved Chat bindings were last re-proved, per Host.
     @ObservationIgnored private var chatCacheValidatedGenerations: [Host.ID: UInt64] = [:]
     @ObservationIgnored private var chatCacheRetention: Task<Void, Never>?
@@ -286,9 +308,15 @@ final class ConsoleStore {
         chatPrefetchRetryDelay: Duration = .seconds(5),
         pins: PinnedAgentsStore = PinnedAgentsStore(),
         rowLayouts: AgentRowLayoutStore = AgentRowLayoutStore(),
+        dismissedLaunchNotices: ChatLaunchNoticeDismissalStore = ChatLaunchNoticeDismissalStore(),
         chatCache: any ChatTranscriptCache = VolatileChatTranscriptCache(),
+        hostFileCache: HostFileCache = HostFileCache(
+            root: FileManager.default.temporaryDirectory.appending(
+                path: "HostFileCache-\(UUID().uuidString)", directoryHint: .isDirectory)),
         usageWidgets: AgentUsageWidgetPublisher? = nil,
         usageSettings: AgentUsageSettings = AgentUsageSettings(),
+        gitHubSettings: GitHubSettings = GitHubSettings(),
+        gitHubCache: any GitHubListCache = VolatileGitHubListCache(),
         launchPresets: LaunchPresetStore = LaunchPresetStore(),
         makeSession: @escaping @Sendable (Host, [EventSubscription]) -> EventsSession =
             ConsoleStore.sshSessionFactory(),
@@ -341,9 +369,11 @@ final class ConsoleStore {
         self.pendingTitleRenameSleep = pendingTitleRenameSleep
         self.hostHelperBundle = hostHelperBundle
         self.chatCache = chatCache
+        self.hostFileCache = hostFileCache
         cachedChats = ConsoleChatCache(cache: chatCache)
         self.usageWidgets = usageWidgets
         self.usageSettings = usageSettings
+        gitHub = GitHubStore(settings: gitHubSettings, cache: gitHubCache)
         self.launchPresets = launchPresets
         self.chatAdapter = chatAdapter
         let terminalBudget = TerminalRetentionBudget()
@@ -353,17 +383,29 @@ final class ConsoleStore {
         self.chatPrefetchRetryDelay = chatPrefetchRetryDelay
         self.pins = pins
         self.rowLayouts = rowLayouts
+        self.dismissedLaunchNotices = dismissedLaunchNotices
         self.makeSession = makeSession
         self.connectCore = connectCore
         self.connectTmux = connectTmux
         self.connectPortPreview = connectPortPreview
-        cachedChats.onChange = { [weak self] in
-            self?.rebuildAgentOrder()
+        cachedChats.onChange = { [weak self] hostID in
+            guard let self, !self.isRebuilding else { return }
+            if let hostID, let projection = self.projections[hostID],
+                !projection.showsSavedChats,
+                self.sidebarSnapshots.snapshot(for: hostID) != nil
+            {
+                let hasUnresolvedAgy = projection.agentsByPane.values.contains {
+                    $0.agent.kind == ChatProgram.agy.rawValue && !self.agyTitles.hasResolvedState(for: $0)
+                }
+                if !hasUnresolvedAgy { return }
+            }
+            self.rebuildAgentOrder()
         }
         sidebarSnapshots.onLoaded = { [weak self] hostID, snapshot in
             guard let self, let host = projections[hostID]?.host else { return }
             cachedChats.record(sidebarSnapshot: snapshot, on: host)
         }
+        gitHub.access = self
     }
 
     /// Pins or unpins the Agent and re-sorts the published list in the same
@@ -404,11 +446,16 @@ final class ConsoleStore {
             pendingTitleRenames.retainHosts(hostsOutOfSight.union(incoming.keys))
         }
         cachedChats.setHosts(hosts)
+        gitHub.setCatalog(catalogHosts, hostsOutOfSight: hostsOutOfSight)
         for id in projections.keys where incoming[id] != projections[id]?.host {
             chatPrefetchTasks[id]?.cancel()
             chatPrefetchTasks[id] = nil
+            chatPrefetchActiveAgent[id] = nil
             chatPrefetched = chatPrefetched.filter { $0.key.hostID != id }
             chatPrefetchRetries = chatPrefetchRetries.filter { $0.key.hostID != id }
+            chatPrefetchAwaitingTurnStatus = chatPrefetchAwaitingTurnStatus.filter {
+                $0.key.hostID != id
+            }
             chatCacheValidatedGenerations[id] = nil
         }
         for (id, session) in composerSessions where incoming[id.hostID] == nil {
@@ -426,11 +473,14 @@ final class ConsoleStore {
         // running leaves a cache no one else would delete. Chained, so the
         // cache ends on the latest catalog whatever order tasks start in.
         let hostIDs = Set(incoming.keys)
-        chatCacheRetention = Task { [previous = chatCacheRetention, chatCache] in
+        dismissedLaunchNotices.retainHosts(hostIDs)
+        chatCacheRetention = Task { [previous = chatCacheRetention, chatCache, hostFileCache] in
             await previous?.value
             await chatCache.retainHosts(hostIDs)
+            await hostFileCache.retainHosts(hostIDs)
         }
         for (id, projection) in projections where incoming[id] != projection.host {
+            dismissedLaunchNotices.removeHost(id)
             sidebarSnapshots.invalidate(id)
             pluginStatuses.invalidate(id)
             agyTitles.invalidateHost(id)
@@ -441,6 +491,7 @@ final class ConsoleStore {
             terminalTransportGenerations[id] = nil
             hostPlatforms[id] = nil
             hostPlatformGenerations[id] = nil
+            gitHubDesktopRoutes[id] = nil
             Task {
                 await terminalConnections.removeHost(id)
                 await agentTerminals.removeHost(id)
@@ -821,7 +872,8 @@ final class ConsoleStore {
             hostPlatforms[hostID] = platform
             rebuildCapabilities()
         }
-        reconcileChatCache()
+        syncCachedChats()
+        reconcileChatPrefetches()
         reconcileAgyAnnotationTitles()
     }
 
@@ -1154,14 +1206,22 @@ final class ConsoleStore {
         chatStores[agent.id]?.end()
         let hostID = agent.hostID
         let paneID = agent.agent.paneID
+        var files = chatHostFiles(for: hostID, agentID: agent.id)
+        if program == .amp {
+            guard host.serverKind == .herdrTUI else { return nil }
+            files.amp = AmpChatConnection(pane: paneID) { [weak self] in
+                guard let live = self?.projections[hostID] as? HostConsoleProjection else { throw TransportError.cancelled }
+                return live
+            }
+        }
         var source = AgentChatSource(
             hostID: hostID, socketLocation: host.socketLocation,
-            files: chatHostFiles(for: hostID, agentID: agent.id),
+            files: files,
             agentInfo: { [weak self] in
                 guard let self else { throw TransportError.cancelled }
                 return try await self.liveChatAgentInfo(hostID: hostID, paneID: paneID)
             },
-            cache: chatCache, adapter: adapter,
+            cache: chatCache, adapter: adapter, fileCache: hostFileCache,
             cachedSession: { [weak self] agent in
                 guard let self else { return nil }
                 return await self.cachedChats.cachedSession(for: agent, on: host)
@@ -1185,6 +1245,9 @@ final class ConsoleStore {
                 }))
         if let typing = hostProjection.checkedChatTyping(at: paneID) {
             source.screen = typing.blockedScreen
+        }
+        if let amp = files.amp {
+            source.sessionEvidence = { try await amp.evidence() }
         }
         if let processBound {
             // No record names a session here.
@@ -1227,11 +1290,21 @@ final class ConsoleStore {
         source.onDidBecomeVisible = { [weak self] in
             self?.preemptBackgroundPrefetchForVisibleChat(agent.id)
         }
+        source.onWillPerformVisibleRead = { [weak self] in
+            self?.preemptBackgroundPrefetchForVisibleChat(agent.id)
+        }
+        source.yieldToVisibleChat = { [weak self] in
+            await self?.yieldToForegroundChatLoad(on: hostID)
+        }
+        source.hasVisibleChatOnHost = { [weak self] in
+            self?.hasVisibleChat(on: hostID) == true
+        }
         let rawAgent =
             projections[hostID]?.agentsByPane[paneID].map { applyingAgyAnnotationTitle(to: $0).agent }
             ?? agent.agent
         let store = AgentChatStore(
-            agentID: agent.id, agent: rawAgent, program: program, source: source, timing: chatTiming, now: chatNow)
+            agentID: agent.id, agent: rawAgent, program: program, source: source,
+            dismissedLaunchNotices: dismissedLaunchNotices, timing: chatTiming, now: chatNow)
         store.hostConnectionChanged(hostStatuses[hostID] == .connected)
         if !isActive { store.suspend() }
         chatStores[agent.id] = store
@@ -1419,12 +1492,24 @@ final class ConsoleStore {
         return directories
     }
 
-    func hasForegroundChatInitialLoad(on hostID: Host.ID) -> Bool {
-        chatStores.contains { $0.key.hostID == hostID && $0.value.isPerformingForegroundInitialLoad }
+    func hasVisibleChat(on hostID: Host.ID) -> Bool {
+        chatStores.contains { $0.key.hostID == hostID && $0.value.isVisible }
     }
 
-    func yieldToForegroundChatLoad(on hostID: Host.ID) async {
-        let deadline = ContinuousClock.now + .seconds(8)
+    func hasForegroundChatInitialLoad(on hostID: Host.ID) -> Bool {
+        chatStores.contains {
+            $0.key.hostID == hostID
+                && ($0.value.isPerformingForegroundInitialLoad || $0.value.isPerformingVisibleStep)
+        }
+    }
+
+    nonisolated static let foregroundChatLoadYieldCap: Duration = .seconds(60)
+
+    func yieldToForegroundChatLoad(
+        on hostID: Host.ID,
+        maximumWait: Duration = foregroundChatLoadYieldCap
+    ) async {
+        let deadline = ContinuousClock.now + maximumWait
         while !Task.isCancelled, isActive, ContinuousClock.now < deadline,
             hasForegroundChatInitialLoad(on: hostID)
         {
@@ -1433,12 +1518,14 @@ final class ConsoleStore {
     }
 
     /// Cancels an in-flight background `prefetch()` of another Agent on the
-    /// same Host when a Chat opens on screen and needs the SFTP channel for its
-    /// initial open, resuming background prefetches once foreground loading
-    /// settles.
+    /// same Host when a Chat opens on screen or performs a visible read and
+    /// needs the SFTP channel immediately, resuming background prefetches once
+    /// foreground work settles.
     private func preemptBackgroundPrefetchForVisibleChat(_ visibleAgentID: ConsoleAgent.ID) {
         let hostID = visibleAgentID.hostID
-        guard let chat = chatStores[visibleAgentID], chat.isPerformingForegroundInitialLoad else { return }
+        guard let chat = chatStores[visibleAgentID],
+            chat.isPerformingForegroundInitialLoad || chat.isPerformingVisibleStep
+        else { return }
         var preemptedPrefetch = false
         if let runningTask = chatPrefetchTasks[hostID],
             let activePrefetch = chatPrefetchActiveAgent[hostID],
@@ -1450,13 +1537,14 @@ final class ConsoleStore {
             chatPrefetched[activePrefetch] = nil
             preemptedPrefetch = true
         }
-        let preemptedAgyTitles = agyTitles.cancelInFlight(on: hostID)
+        let preemptedAgyTitles =
+            chat.isPerformingForegroundInitialLoad ? agyTitles.cancelInFlight(on: hostID) : false
         guard preemptedPrefetch || preemptedAgyTitles else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.yieldToForegroundChatLoad(on: hostID)
             guard self.isActive else { return }
-            if preemptedPrefetch { self.reconcileChatCache() }
+            if preemptedPrefetch { self.reconcileChatPrefetches() }
             if preemptedAgyTitles { self.reconcileAgyAnnotationTitles() }
         }
     }
@@ -1472,11 +1560,29 @@ final class ConsoleStore {
         let defersUncachedAgyLocate =
             chatStores[agentID]?.isPerformingForegroundInitialLoad == true
             && !agyTitles.hasCachedResolution(for: fresh, paneID: paneID, on: hostID, generation: generation)
-        let enriched =
-            defersUncachedAgyLocate
-            ? fresh
-            : await readAgyTitleForRename(
+        var snapshotRowForAgy = snapshot
+        snapshotRowForAgy?.agent = fresh
+        let skipsSteadyIdleAgyRecheck =
+            snapshotRowForAgy.map { row in
+                fresh.kind == ChatProgram.agy.rawValue
+                    && fresh.agentSession != nil
+                    && fresh.agentSession == snapshot?.agent.agentSession
+                    && agyTitles.hasResolvedState(for: row)
+                    && titleRenamesInFlight[agentID] == nil
+            } ?? false
+        let enriched: Agent
+        if defersUncachedAgyLocate {
+            enriched = fresh
+        } else if skipsSteadyIdleAgyRecheck {
+            enriched =
+                agyTitles.knownTitle(for: fresh, id: agentID).map(fresh.applyingConversationTitle)
+                ?? (snapshotRowForAgy.map(agyTitles.isKnownUntitled) == true
+                    ? fresh.clearingUntrackedConversationTitle()
+                    : fresh)
+        } else {
+            enriched = await readAgyTitleForRename(
                 fresh: fresh, paneID: paneID, hostID: hostID, generation: generation)
+        }
         guard projections[hostID] === origin, origin.transportGeneration == generation,
             !origin.isAwaitingSnapshot else { throw TransportError.cancelled }
         if hostPlatforms[hostID] == .posix, let snapshot,
@@ -1509,7 +1615,9 @@ final class ConsoleStore {
         let (stream, continuation) = AsyncStream.makeStream(
             of: AgentStatusUpdate.self, bufferingPolicy: .bufferingNewest(1))
         agentStatusObservers[id, default: [:]][observerID] = continuation
-        continuation.yield(agentStatusUpdate(for: id))
+        let initial = agentStatusUpdate(for: id)
+        lastPublishedAgentStatuses[id] = initial
+        continuation.yield(initial)
         continuation.onTermination = { [weak self] _ in
             Task { @MainActor in
                 self?.removeAgentStatusObserver(observerID, for: id)
@@ -1608,15 +1716,21 @@ final class ConsoleStore {
     /// has ended for good, or the timeout elapses. The new-agent flow (#12) opens the started Agent's
     /// terminal, and the row it navigates to exists only once the post-start
     /// resync lands — waiting keeps the detail column from flashing its
-    /// missing-Agent placeholder over a launch that just succeeded.
+    /// missing-Agent placeholder over a launch that just succeeded. A row
+    /// whose launch shell has not started the program yet is not reported.
     func waitForAgent(_ id: ConsoleAgent.ID, timeout: Duration = .seconds(5)) async {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        while !agents.contains(where: { $0.id == id }), programExit(of: id) == nil {
+        while !hasStarted(id), programExit(of: id) == nil {
             guard clock.now < deadline,
                 (try? await Task.sleep(for: .milliseconds(50))) != nil
             else { return }
         }
+    }
+
+    /// Listed, and past the shell its launch runs the program through.
+    private func hasStarted(_ id: ConsoleAgent.ID) -> Bool {
+        agents.contains { $0.id == id } && projections[id.hostID]?.isStartingProgram(ofPane: id.paneID) != true
     }
 
     /// Suspends until a shell created on `hostID` is in the terminal
@@ -1646,7 +1760,9 @@ final class ConsoleStore {
         _ paneID: String, on hostID: Host.ID, keepingTo corePin: TerminalCorePin? = nil
     ) async throws {
         guard !hasLeftCore(corePin, on: hostID) else { throw leftCoreError(on: hostID) }
+        let closing = terminalIDs(of: agents.filter { $0.hostID == hostID && $0.agent.paneID == paneID })
         try await projection(for: hostID).closePane(paneID)
+        forgetFiles(openedBy: closing, on: hostID)
         flushScheduledRebuild()
     }
 
@@ -1687,19 +1803,33 @@ final class ConsoleStore {
             let paneID = agent.agent.paneID
             try await projection(for: hostID).closePane(paneID)
             pins.removePin(hostID: hostID, paneID: paneID)
+            forgetFiles(openedBy: [agent.agent.terminalID], on: hostID)
             rebuild()
             return
         }
         let tabID = agent.agent.tabID
-        let pinnedPaneIDs = agents
-            .filter { $0.hostID == hostID && $0.agent.tabID == tabID }
+        let closing = agents.filter { $0.hostID == hostID && $0.agent.tabID == tabID }
+        let pinnedPaneIDs = closing
             .map(\.agent.paneID)
             .filter { pins.isPinned(hostID: hostID, paneID: $0) }
         try await projection(for: hostID).closeTab(tabID)
         for paneID in pinnedPaneIDs {
             pins.removePin(hostID: hostID, paneID: paneID)
         }
+        forgetFiles(openedBy: terminalIDs(of: closing + [agent]), on: hostID)
         rebuild()
+    }
+
+    private func terminalIDs(of agents: [ConsoleAgent]) -> Set<String> {
+        Set(agents.map(\.agent.terminalID))
+    }
+
+    /// Deletes the Host files these Agents (by terminal id) opened that no
+    /// other Agent opened too. Only closing an Agent or removing its saved
+    /// Chat forgets: one that ends on the Host leaves its copies to age out.
+    private func forgetFiles(openedBy terminalIDs: Set<String>, on hostID: Host.ID) {
+        guard !terminalIDs.isEmpty else { return }
+        Task { [hostFileCache] in await hostFileCache.forget(openers: terminalIDs, on: hostID) }
     }
 
     /// What a Close Agent dialog opened now asks for.
@@ -1717,6 +1847,7 @@ final class ConsoleStore {
         chatStores.removeValue(forKey: agent.id)?.end()
         cachedChats.remove(paneID: agent.agent.paneID, on: host)
         pins.removePin(hostID: agent.hostID, paneID: agent.agent.paneID)
+        forgetFiles(openedBy: [agent.agent.terminalID], on: agent.hostID)
         rebuild()
         return true
     }
@@ -2285,6 +2416,9 @@ final class ConsoleStore {
     /// Each Server Kind has its own projection, behind one seam (ADR 0032).
     private func startProjection(for host: Host) {
         let onChange: @MainActor @Sendable () -> Void = { [weak self] in self?.scheduleRebuild() }
+        let onLatencyChange: @MainActor @Sendable () -> Void = { [weak self, id = host.id] in
+            self?.updateHostLatency(for: id)
+        }
         let projection: any ConsoleHostProjection =
             if let makeProjection {
                 makeProjection(host)
@@ -2302,6 +2436,7 @@ final class ConsoleStore {
                         onSeenMarksChanged: { [weak self, id = host.id] core, marks in
                             self?.onCoreSeenMarksChanged?(id, core, marks)
                         },
+                        onLatencyChange: onLatencyChange,
                         onChange: onChange)
                 case .tmux:
                     TmuxConsoleProjection(
@@ -2314,22 +2449,33 @@ final class ConsoleStore {
                         onSeenMarksChanged: { [weak self, id = host.id] core, marks in
                             self?.onCoreSeenMarksChanged?(id, core, marks)
                         },
+                        onLatencyChange: onLatencyChange,
                         onChange: onChange)
                 case .rex:
                     RexConsoleProjection(
                         host: host, session: makeRexSession(host), memory: coreHostMemory, pins: pins,
+                        onLatencyChange: onLatencyChange,
                         onChange: onChange)
                 case .herdrTUI, .unconfirmed:
                     HostConsoleProjection(
                         host: host,
                         session: makeSession(host, HostConsoleProjection.subscriptions(paneIDs: [])),
                         snapshotRetryDelay: snapshotRetryDelay,
+                        onLatencyChange: onLatencyChange,
                         onChange: onChange)
                 }
             }
         projections[host.id] = projection
         projection.setShownAgents(shownAgents(on: host.id))
         projection.start(isActive: isActive)
+    }
+
+    private func updateHostLatency(for hostID: Host.ID) {
+        guard let projection = projections[hostID] else { return }
+        let latest = projection.latency
+        if hostLatencies[hostID] != latest {
+            hostLatencies[hostID] = latest
+        }
     }
 
     #if DEBUG
@@ -2465,6 +2611,17 @@ final class ConsoleStore {
         if hostsAwaitingSnapshot != nextAwaitingSnapshot {
             hostsAwaitingSnapshot = nextAwaitingSnapshot
         }
+        if !dismissedLaunchNotices.isEmpty {
+            for projection in current {
+                let hostID = projection.host.id
+                guard hostStatuses[hostID] == .connected,
+                    !hostsAwaitingSnapshot.contains(hostID),
+                    dismissedLaunchNotices.hasEntries(for: hostID)
+                else { continue }
+                let liveTerminalIDs = Set(projection.agentsByPane.values.map(\.agent.terminalID))
+                dismissedLaunchNotices.retainTerminals(hostID: hostID, terminalIDs: liveTerminalIDs)
+            }
+        }
         let nextAwaitingForeground = Set(
             current.lazy.flatMap { projection in
                 projection.panesAwaitingForeground.map { ConsoleAgent.ID(hostID: projection.host.id, paneID: $0) }
@@ -2511,7 +2668,7 @@ final class ConsoleStore {
                 let generation = hostConnectionGenerations[projection.host.id]
             else { return nil }
             return (projection.host.id, HerdrSidebarSnapshotStore.Connection(
-                generation: generation, revision: projection.sidebarRevision))
+                generation: generation, revision: projection.sidebarLayoutRevision))
         })
         sidebarSnapshots.reconcile(sidebarConnections, transports: self) { [weak self] in
             self?.rebuildAgentOrder()
@@ -2538,9 +2695,10 @@ final class ConsoleStore {
             .sorted { ($0.hostID.uuidString, $0.agent.paneID) < ($1.hostID.uuidString, $1.agent.paneID) }
         if departedAgents != nextDeparted { departedAgents = nextDeparted }
         publishChatAgents()
+        syncCachedChats()
         rebuildAgentOrder()
         publishAgentStatuses()
-        reconcileChatCache()
+        reconcileChatPrefetches()
         reconcileAgyAnnotationTitles()
         reconcilePendingTitleRenames()
         // A reconnecting Host's empty projection is not proof its Agents
@@ -2838,6 +2996,19 @@ final class ConsoleStore {
         refreshStaleWidgetUsage()
     }
 
+    var isGitHubEnabled: Bool { gitHub.settings.isEnabled }
+
+    /// Turning GitHub off stops its reads and removes every list, here and
+    /// on the device; the chosen Host stays for when it returns.
+    func setGitHubEnabled(_ enabled: Bool) {
+        guard enabled != isGitHubEnabled else { return }
+        gitHub.settings.setEnabled(enabled)
+        if !enabled {
+            gitHub.reset()
+            gitHubDesktopRoutes.removeAll()
+        }
+    }
+
     /// Hands every catalog Host's current Usage reading to the widgets, each
     /// Host once through the Server it is read through now.
     private func publishUsageWidgets() {
@@ -2980,6 +3151,7 @@ final class ConsoleStore {
         if hostCapabilities != next {
             hostCapabilities = next
         }
+        gitHub.refreshHosts()
     }
 
     private func rebuildHostIssues() {
@@ -3511,12 +3683,20 @@ final class ConsoleStore {
         if let program = ChatProgram(rawValue: agent.agent.kind), !capabilities.offersChat(for: program) {
             return nil
         }
-        // A tmux or Rex Host is POSIX without asking it (ADRs 0044 and 0056).
-        let kind = catalog.first(where: { $0.id == agent.hostID })?.serverKind
-        let platform = hostPlatforms[agent.hostID] ?? (kind == .tmux || kind == .rex ? .posix : nil)
+        // A tmux or Rex Host is POSIX without asking it (ADRs 0044 and 0056),
+        // except a Rex Host reached by a Windows named pipe (ADR 0049). A Rex
+        // Host's Chat reads native Windows as a core's does, for the programs
+        // its capabilities name from the server's platform.
+        let host = catalog.first(where: { $0.id == agent.hostID })
+        let kind = host?.serverKind
+        let platform =
+            kind == .rex && host?.rexSocket?.isWindowsPipe == true
+            ? .nativeWindows
+            : hostPlatforms[agent.hostID] ?? (kind == .tmux || kind == .rex ? .posix : nil)
         if let platform {
             return AgentChatAvailability.program(
-                for: agent.agent, platform: platform, isNativeWindowsCore: capabilities.isNativeWindowsCore,
+                for: agent.agent, platform: platform,
+                readsChatOnNativeWindows: capabilities.isNativeWindowsCore || kind == .rex,
                 hasAdapter: { chatAdapter($0) != nil })
         }
         guard let host = projections[agent.hostID]?.host,
@@ -3525,19 +3705,12 @@ final class ConsoleStore {
             for: agent.agent, platform: .posix, hasAdapter: { chatAdapter($0) != nil })
     }
 
-    private func reconcileChatCache() {
-        let span = PerfTrace.begin("console.rebuild.chat-cache")
-        defer { PerfTrace.end(span) }
+    private func syncCachedChats() {
         for projection in projections.values {
             let host = projection.host
             guard host.capabilities.chat, isActive,
-                projection.status == .connected, !projection.isAwaitingSnapshot else {
-                chatPrefetchTasks[host.id]?.cancel()
-                chatPrefetchTasks[host.id] = nil
-                chatPrefetched = chatPrefetched.filter { $0.key.hostID != host.id }
-                chatPrefetchRetries = chatPrefetchRetries.filter { $0.key.hostID != host.id }
-                continue
-            }
+                projection.status == .connected, !projection.isAwaitingSnapshot
+            else { continue }
             guard hostPlatforms[host.id] == .posix else { continue }
             if chatCacheValidatedGenerations[host.id] != projection.transportGeneration {
                 chatCacheValidatedGenerations[host.id] = projection.transportGeneration
@@ -3562,6 +3735,36 @@ final class ConsoleStore {
                 return row
             }
             cachedChats.observe(observed, conversationTitles: conversationTitles, on: host)
+        }
+    }
+
+    private func reconcileChatPrefetches() {
+        let span = PerfTrace.begin("console.rebuild.chat-cache")
+        defer { PerfTrace.end(span) }
+        for projection in projections.values {
+            let host = projection.host
+            guard host.capabilities.chat, isActive,
+                projection.status == .connected, !projection.isAwaitingSnapshot else {
+                chatPrefetchTasks[host.id]?.cancel()
+                chatPrefetchTasks[host.id] = nil
+                chatPrefetchActiveAgent[host.id] = nil
+                chatPrefetched = chatPrefetched.filter { $0.key.hostID != host.id }
+                chatPrefetchRetries = chatPrefetchRetries.filter { $0.key.hostID != host.id }
+                chatPrefetchAwaitingTurnStatus = chatPrefetchAwaitingTurnStatus.filter {
+                    $0.key.hostID != host.id
+                }
+                continue
+            }
+            guard hostPlatforms[host.id] == .posix else { continue }
+            for agent in projection.agentsByPane.values {
+                if let priorStatus = chatPrefetchAwaitingTurnStatus[agent.id],
+                    priorStatus != agent.agent.status
+                {
+                    chatPrefetchAwaitingTurnStatus[agent.id] = nil
+                    chatPrefetched[agent.id] = nil
+                    chatPrefetchRetries[agent.id] = nil
+                }
+            }
             guard chatPrefetchTasks[host.id] == nil else { continue }
             let generation = projection.transportGeneration
             let candidates = projection.agentsByPane.values.filter { agent in
@@ -3602,21 +3805,44 @@ final class ConsoleStore {
                     }
                     guard !Task.isCancelled else { return }
                     let snapshot = chat.conversation
+                    let latestStatus = projection.agentsByPane[agent.agent.paneID]?.agent.status ?? agent.agent.status
+                    chatPrefetchAwaitingTurnStatus[agent.id] =
+                        Self.chatPrefetchRearmsOnStatusChange(snapshot) ? latestStatus : nil
                     let retries = chatPrefetchRetries[agent.id].flatMap { $0.key == key ? $0.count : nil } ?? 0
-                    chatPrefetchRetries[agent.id] =
-                        Self.chatPrefetchWaits(on: snapshot.phase) ? (key, retries + 1) : nil
-                    if !prefetched || snapshot.readFailure != nil
-                        || Self.chatPrefetchRetries(after: retries, phase: snapshot.phase)
-                    {
+                    if !prefetched {
                         chatPrefetched[agent.id] = nil
                         needsRetry = true
+                    } else {
+                        let tracksRetry = snapshot.readFailure != nil || Self.chatPrefetchWaits(on: snapshot.phase)
+                        chatPrefetchRetries[agent.id] = tracksRetry ? (key, retries + 1) : nil
+                        if Self.chatPrefetchRetries(after: retries, snapshot: snapshot) {
+                            chatPrefetched[agent.id] = nil
+                            needsRetry = true
+                        }
                     }
                 }
                 if needsRetry { try? await Task.sleep(for: chatPrefetchRetryDelay) }
                 guard !Task.isCancelled, projections[host.id] === projection else { return }
                 chatPrefetchTasks[host.id] = nil
-                reconcileChatCache()
+                reconcileChatPrefetches()
             }
+        }
+    }
+
+    /// Whether a subsequent Agent status change should re-arm a completed
+    /// background prefetch: only when the Host answered cleanly
+    /// (`readFailure == nil`) and the bound conversation is genuinely awaiting
+    /// its transcript file to be created by a turn — never on SFTP/read
+    /// timeouts or sessionless (`.noSession` / deferred `.locating`) panes.
+    nonisolated static func chatPrefetchRearmsOnStatusChange(
+        _ snapshot: ChatConversationSnapshot
+    ) -> Bool {
+        guard snapshot.readFailure == nil else { return false }
+        switch snapshot.phase {
+        case .unavailable(.awaitingFirstMessage), .unavailable(.notFound):
+            return true
+        default:
+            return false
         }
     }
 
@@ -3639,8 +3865,21 @@ final class ConsoleStore {
         chatPrefetchWaits(on: phase) && retries < 3
     }
 
+    /// Whether a completed prefetch pass for `snapshot` should retry in the
+    /// background after `retries` earlier attempts for the same key.
+    nonisolated static func chatPrefetchRetries(
+        after retries: Int,
+        snapshot: ChatConversationSnapshot
+    ) -> Bool {
+        if let failure = snapshot.readFailure {
+            if case .hostFeatureUnavailable = failure { return false }
+            return retries < 3
+        }
+        return chatPrefetchRetries(after: retries, phase: snapshot.phase)
+    }
+
     private func chatPrefetchKey(_ agent: ConsoleAgent, generation: UInt64) -> String {
-        "\(generation):\(agent.agent.terminalID):\(agent.agent.kind):\(agent.agent.status):\(agent.agent.agentSession?.value ?? "")"
+        "\(generation):\(agent.agent.terminalID):\(agent.agent.kind):\(agent.agent.agentSession?.value ?? "")"
     }
 
     /// Hands each Chat its Agent's latest record, and ends the Chats of
@@ -3702,6 +3941,8 @@ final class ConsoleStore {
     private func publishAgentStatuses() {
         for (id, observers) in agentStatusObservers {
             let update = agentStatusUpdate(for: id)
+            guard lastPublishedAgentStatuses[id] != update else { continue }
+            lastPublishedAgentStatuses[id] = update
             for continuation in observers.values {
                 continuation.yield(update)
             }
@@ -3722,6 +3963,7 @@ final class ConsoleStore {
         agentStatusObservers[id]?[observerID] = nil
         if agentStatusObservers[id]?.isEmpty == true {
             agentStatusObservers[id] = nil
+            lastPublishedAgentStatuses[id] = nil
         }
     }
 }
@@ -4057,5 +4299,63 @@ extension ConsoleStore {
             credentials: resolved,
             hostKeyPolicy: HostKeyPolicy(knownHosts: knownHosts) { _ in false },
             overlays: overlays)
+    }
+}
+
+// MARK: - gh on the Hosts (ADR 0065)
+extension ConsoleStore: GitHubHostAccess {
+    func isConnected(_ recordID: Host.ID) -> Bool {
+        hostStatuses[recordID] == .connected && projections[recordID] != nil
+    }
+
+    /// A Rex Host reached by a Windows named pipe (ADR 0049) is one from
+    /// its record: its connection reports no platform of its own.
+    func isNativeWindows(_ recordID: Host.ID) -> Bool {
+        catalog.first(where: { $0.id == recordID })?.rexSocket?.isWindowsPipe == true
+            || hostPlatforms[recordID] == .nativeWindows
+    }
+
+    /// Straight to the desktop session on a connection whose gh needed it
+    /// before; the exec first otherwise. A write is sent once. git always
+    /// tries the exec first and leaves the route as it was: a fetch over
+    /// ssh, or of a public repository, needs no desktop session where gh
+    /// does.
+    func runGitHub(_ request: GitHubCLIRequest, on recordID: Host.ID) async throws -> GitHubCLIOutcome {
+        let projection = try projection(for: recordID)
+        let generation = projection.transportGeneration
+        let isGH = request.program == .gh
+        let mode: GitHubCLIScript.Mode = isGH && gitHubDesktopRoutes[recordID] == generation ? .desktop : .auto
+        let nonce = GitProbe.makeNonce()
+        let result = try await projection.runGitHubScript(
+            GitHubCLIScript.script(for: request, mode: mode, nonce: nonce), isMutation: request.isMutation)
+        guard let outcome = GitHubCLIOutcome(stdout: result.stdout, nonce: nonce) else {
+            throw GitHubCLIError.unreadableOutput
+        }
+        guard isGH, projections[recordID] === projection else { return outcome }
+        switch outcome.run?.route {
+        case .ran(.desktop):
+            gitHubDesktopRoutes[recordID] = generation
+        case .ran(.exec), .desktopUnavailable:
+            gitHubDesktopRoutes[recordID] = nil
+        case .desktopTimedOut, .failed, nil:
+            break
+        }
+        return outcome
+    }
+
+    func runGitHubSeamScript(_ script: Data, on recordID: Host.ID) async throws -> GitExecResult {
+        try await projection(for: recordID).runGitHubScript(script, isMutation: false)
+    }
+
+    func forgetGitHubRoutes(_ recordIDs: [Host.ID]) {
+        for id in recordIDs { gitHubDesktopRoutes[id] = nil }
+    }
+
+    /// The Agents GitHub's Send to Agent offers on a Host: the live ones on
+    /// any of its Servers whose Composer can send.
+    func gitHubSendTargets(on records: [Host.ID]) -> [ConsoleAgent] {
+        agents.filter { agent in
+            records.contains(agent.hostID) && !isSavedChat(agent.id) && capabilities(for: agent.hostID).composerSend
+        }
     }
 }

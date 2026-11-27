@@ -57,6 +57,18 @@ private final class HeelerSSHAttachPumpCancellation: Sendable {
     }
 }
 
+private final class AcquiredSessionFileClientID: Sendable {
+    private let storage = Mutex<UInt64?>(nil)
+
+    func record(_ id: UInt64) {
+        storage.withLock { $0 = id }
+    }
+
+    var id: UInt64? {
+        storage.withLock { $0 }
+    }
+}
+
 private enum HeelerSSHNotificationFileError: Error, Sendable {
     case permissionVerificationFailed
 }
@@ -419,8 +431,13 @@ actor HeelerSSHTransport: Transport {
     /// The Host's herdr endpoint launcher (ADR 0023); nil runs the `herdr` on
     /// the SSH PATH.
     private let herdrLauncher: HerdrLauncher?
-    /// A herdr-core Host's connection, whose Chat also reads on native Windows.
+    /// A herdr-core or Rex Host's connection, whose Chat also reads on native
+    /// Windows.
     private let readsChatFilesOnWindows: Bool
+    /// A Rex Host's connection, whose Chat reads a native Windows Host's
+    /// processes and home here, as a core's transport reads them for its own
+    /// Chat (ADR 0056).
+    private let servesRexHost: Bool
     nonisolated let channelAdmission: SSHChannelAdmission
     private let environment = SharedAsyncOperation<RemoteHostEnvironment>(cachesSuccess: true)
     private let windowsBridgeCheck = SharedAsyncOperation<Void>(cachesSuccess: true)
@@ -453,20 +470,14 @@ actor HeelerSSHTransport: Transport {
 
     private var imageStageClients: [UUID: AdmittedStagingSFTPClient] = [:]
     private var notificationFileClients: [UUID: SSHSFTPClient] = [:]
-    /// One SFTP channel held for ranged Host-file reads (#325). Sessions are
-    /// followed, not staged, so this one outlives any single request — and so
-    /// does its admission lease, which is what keeps the server-side channel
-    /// budget honest.
-    private var sessionFileClient: SSHSFTPClient?
-    private var sessionFileClientLease: SSHChannelAdmissionLease?
-    /// The open in flight, so readers that arrive while nothing is open yet
-    /// share it: the actor is re-entered at every await inside that open, and
-    /// two independent opens would each keep a channel, one of them unowned.
-    private var sessionFileClientOpening: Task<SSHSFTPClient, any Error>?
-    private var sessionFileReadsInFlight = 0
-    /// Returns the channel once no follower has read for a while. A screen
-    /// that stopped looking does not tell the Transport so; without this the
-    /// channel and its lease would stay spent until the Host disconnects.
+    /// Shared SFTP channels held for ranged Host-file reads (#325): one
+    /// active healthy client plus any condemned clients draining their last
+    /// in-flight readers before closing and releasing their admission leases.
+    private var sessionFilePool = SessionFileClientPool<SSHSFTPClient>()
+    /// The open in flight, so readers that arrive while nothing healthy is
+    /// installed share it instead of opening duplicate channels.
+    private var sessionFileClientOpening: Task<Void, any Error>?
+    /// Returns the active channel once no follower has read for a while.
     private var sessionFileClientIdleRelease: Task<Void, Never>?
     static let sessionFileClientIdleTimeout: Duration = .seconds(30)
     /// The Host's refusal of the SFTP subsystem, which every SFTP open here
@@ -477,6 +488,9 @@ actor HeelerSSHTransport: Transport {
     /// avoiding repeated `mktemp` exec + `chmod` round trips across uploads
     /// when `stageDirectoryCommand` uses the default command.
     private var cachedStageParentDirectory: String?
+    /// A native Windows Rex Host's staging folder on this connection, in the
+    /// form SFTP opens, made over SFTP by the first upload (`stageOnWindows`).
+    private var cachedWindowsStageParentDirectory: String?
     /// Reusable dedicated SFTP client for attachment staging (separate from
     /// Chat's `sessionFileClient`), holding its `.ordinarySession` admission
     /// lease until retired after an idle grace window or on error/close so
@@ -748,6 +762,7 @@ actor HeelerSSHTransport: Transport {
             SSHTransportSettings.defaultNotificationConfigDirCommand
         herdrLauncher = nil
         readsChatFilesOnWindows = false
+        servesRexHost = false
         sftpRefusal = HostSFTPRefusal()
         channelAdmission = SSHChannelAdmission()
     }
@@ -770,7 +785,8 @@ actor HeelerSSHTransport: Transport {
         pluginListCommand = settings.pluginListCommand
         notificationConfigDirCommand = settings.notificationConfigDirCommand
         herdrLauncher = settings.herdrLauncher
-        readsChatFilesOnWindows = settings.serverKind == .herdrCore
+        readsChatFilesOnWindows = settings.serverKind == .herdrCore || settings.serverKind == .rex
+        servesRexHost = settings.serverKind == .rex
         sftpRefusal = settings.sftpRefusal ?? HostSFTPRefusal()
         channelAdmission = SSHChannelAdmission()
     }
@@ -1020,36 +1036,26 @@ actor HeelerSSHTransport: Transport {
     /// The lease is held for as long as the channel is (ADR 0011, #148): an
     /// app-side counter that ignored a channel still open would let the
     /// server's `MaxSessions` be spent while admission looked free. A read
-    /// that fails because the channel is unusable drops both, so the next
-    /// look opens a fresh one rather than reading through a corpse. A
-    /// cancellation or a file-level SFTP status says nothing about the
-    /// channel, and while another read (Chat shares the channel) still holds
-    /// it, closing would time out behind that read and free the lease of a
-    /// channel still open; that reader's own failure retires it instead.
-    /// The channel is returned once nobody has read through it for
-    /// `sessionFileClientIdleTimeout`.
+    /// that times out or fails with a channel/generic SFTP failure condemns
+    /// that client at once so the next caller opens a fresh channel, while
+    /// keeping the condemned client's lease until its last in-flight reader
+    /// finishes and closes it. Benign file-level SFTP statuses keep the
+    /// channel. The active channel is returned once nobody has read through it
+    /// for `sessionFileClientIdleTimeout`.
     func readFileSlice(_ range: RemoteFileRange) async throws -> RemoteFileSlice {
-        sessionFileClientIdleRelease?.cancel()
-        sessionFileClientIdleRelease = nil
-        sessionFileReadsInFlight += 1
-        defer {
-            sessionFileReadsInFlight -= 1
-            scheduleSessionFileClientIdleRelease()
-        }
+        let (id, client) = try await acquireSessionFileClient()
         do {
-            let client = try await sessionFileClientForReading()
             let slice = try await client.readFileRange(
                 at: range.path,
                 offset: range.offset,
                 maxBytes: range.maxBytes,
                 timeout: requestTimeout)
+            await finishSessionFileRead(id: id, retiresChannel: false)
             return RemoteFileSlice(data: slice.data, length: slice.length)
         } catch {
             let retiresChannel = Self.hostFileFailure(for: error)?.retiresChannel ?? true
             let mapped = await mapOperationError(error)
-            if retiresChannel, sessionFileReadsInFlight == 1 {
-                await releaseSessionFileClient()
-            }
+            await finishSessionFileRead(id: id, retiresChannel: retiresChannel)
             throw mapped
         }
     }
@@ -1069,65 +1075,115 @@ actor HeelerSSHTransport: Transport {
         }
     }
 
-    private func sessionFileClientForReading() async throws -> SSHSFTPClient {
-        if let sessionFileClient { return sessionFileClient }
-        if let opening = sessionFileClientOpening {
-            return try await opening.value
-        }
-        // Inherits this actor's isolation, so the task installs the holder
-        // itself; every caller, first or later, just awaits it.
-        let opening = Task { () throws -> SSHSFTPClient in
-            defer { sessionFileClientOpening = nil }
-            let lease = try await channelAdmission.acquire(.ordinarySession, priority: .interactive)
-            let client: SSHSFTPClient
-            do {
-                client = try await openSFTP()
-            } catch {
-                await lease.release()
-                throw error
-            }
+    private func acquireSessionFileClient(
+        recordingInto box: AcquiredSessionFileClientID? = nil
+    ) async throws -> (id: UInt64, client: SSHSFTPClient) {
+        while true {
+            try Task.checkCancellation()
             guard connected else {
-                // Closed while the open was in flight: `close()` already
-                // drained the holders, so this channel would be unowned.
-                try? await client.close(timeout: .seconds(2))
-                await lease.release()
                 throw TransportError.sshUnreachable(detail: String(localized: "The Host is not connected."))
             }
-            sessionFileClient = client
-            sessionFileClientLease = lease
-            // A Chat read whose deadline passed during the open has already
-            // left; without this the channel would wait for the next read.
-            scheduleSessionFileClientIdleRelease()
-            return client
+            if let acquired = sessionFilePool.acquireCurrent() {
+                sessionFileClientIdleRelease?.cancel()
+                sessionFileClientIdleRelease = nil
+                box?.record(acquired.id)
+                return acquired
+            }
+            if let opening = sessionFileClientOpening {
+                try await opening.value
+                continue
+            }
+            // Inherits this actor's isolation, so the task installs the holder
+            // itself; every caller, first or later, awaits it and loops to
+            // acquire a counted slot on the healthy client.
+            let opening = Task { () throws -> Void in
+                defer { sessionFileClientOpening = nil }
+                let lease = try await channelAdmission.acquire(.ordinarySession, priority: .interactive)
+                let client: SSHSFTPClient
+                do {
+                    client = try await openSFTP()
+                } catch {
+                    await lease.release()
+                    throw error
+                }
+                guard connected else {
+                    // Closed while the open was in flight: `close()` already
+                    // drained the holders, so this channel would be unowned.
+                    try? await client.close(timeout: .seconds(2))
+                    await lease.release()
+                    throw TransportError.sshUnreachable(detail: String(localized: "The Host is not connected."))
+                }
+                let id = sessionFilePool.install(client: client, lease: lease)
+                // A Chat read whose deadline passed during the open has already
+                // left; without this the channel would wait for the next read.
+                scheduleSessionFileClientIdleRelease(for: id)
+            }
+            sessionFileClientOpening = opening
+            try await opening.value
         }
-        sessionFileClientOpening = opening
-        return try await opening.value
     }
 
-    private func scheduleSessionFileClientIdleRelease() {
+    private func runOnSessionFileClient<Value: Sendable>(
+        recordingIDInto box: AcquiredSessionFileClientID,
+        _ operation: @escaping @Sendable (SSHSFTPClient) async throws -> Value
+    ) async throws -> Value {
+        let (id, client) = try await acquireSessionFileClient(recordingInto: box)
+        do {
+            let value = try await operation(client)
+            await finishSessionFileRead(id: id, retiresChannel: false)
+            return value
+        } catch {
+            let retires = Self.hostFileFailure(for: error)?.retiresChannel ?? true
+            await finishSessionFileRead(id: id, retiresChannel: retires)
+            throw error
+        }
+    }
+
+    private func condemnSessionFileClient(id: UInt64) async {
+        let wasCurrent = sessionFilePool.currentID == id
+        let retired = sessionFilePool.condemn(id: id)
+        if wasCurrent {
+            sessionFileClientIdleRelease?.cancel()
+            sessionFileClientIdleRelease = nil
+        }
+        if let retired {
+            try? await retired.client.close(timeout: .seconds(2))
+            await retired.lease.release()
+        }
+    }
+
+    private func finishSessionFileRead(id: UInt64, retiresChannel: Bool) async {
+        let wasCurrent = sessionFilePool.currentID == id
+        let outcome = sessionFilePool.finishRead(id: id, retiresChannel: retiresChannel)
+        if wasCurrent, sessionFilePool.currentID != id {
+            sessionFileClientIdleRelease?.cancel()
+            sessionFileClientIdleRelease = nil
+        }
+        if let retired = outcome.retired {
+            try? await retired.client.close(timeout: .seconds(2))
+            await retired.lease.release()
+        } else if let idleID = outcome.becameIdleCurrentID {
+            scheduleSessionFileClientIdleRelease(for: idleID)
+        }
+    }
+
+    private func scheduleSessionFileClientIdleRelease(for id: UInt64) {
         sessionFileClientIdleRelease?.cancel()
-        guard sessionFileReadsInFlight == 0, sessionFileClient != nil else { return }
+        sessionFileClientIdleRelease = nil
+        guard sessionFilePool.isCurrentIdle(id) else { return }
         sessionFileClientIdleRelease = Task { [weak self] in
             try? await Task.sleep(for: Self.sessionFileClientIdleTimeout)
             guard !Task.isCancelled else { return }
-            await self?.releaseSessionFileClientIfIdle()
+            await self?.releaseSessionFileClientIfIdle(id: id)
         }
     }
 
-    private func releaseSessionFileClientIfIdle() async {
-        guard sessionFileReadsInFlight == 0 else { return }
-        await releaseSessionFileClient()
-    }
-
-    private func releaseSessionFileClient() async {
+    private func releaseSessionFileClientIfIdle(id: UInt64) async {
+        guard let retired = sessionFilePool.takeIfIdle(id: id) else { return }
         sessionFileClientIdleRelease?.cancel()
         sessionFileClientIdleRelease = nil
-        guard let client = sessionFileClient else { return }
-        sessionFileClient = nil
-        let lease = sessionFileClientLease
-        sessionFileClientLease = nil
-        try? await client.close(timeout: .seconds(2))
-        await lease?.release()
+        try? await retired.client.close(timeout: .seconds(2))
+        await retired.lease.release()
     }
 
     // MARK: Chat Host files
@@ -1171,9 +1227,12 @@ actor HeelerSSHTransport: Transport {
     }
 
     func hostHomeDirectory() async throws -> String {
-        let home = try await hostFileEnvironment().home
+        let environment = try await hostFileEnvironment()
+        // A Rex Host's Chat reads a native Windows home over SFTP, in the form
+        // that opens there, as a core's Chat does.
+        if servesRexHost, environment.isWindows { return RemoteFilePath.windowsForSFTP(environment.home) }
         try await requirePOSIXHost(feature: String(localized: "Chat"))
-        return home
+        return environment.home
     }
 
     func agentInfo(_ target: AgentTarget) async throws -> Agent {
@@ -1195,10 +1254,11 @@ actor HeelerSSHTransport: Transport {
     /// failures must stay its own: the whole operation, channel admission and
     /// open included, runs under one deadline that maps to
     /// `.hostFileTimedOut` instead of the link-failure `.timedOut`, and a file
-    /// the server refuses is `.hostFileUnreadable`. Only a failure that says
-    /// the channel itself is unusable retires it, and only when no other read
-    /// is using it: a usage-strip read sharing the channel must not fail
-    /// because a Chat read did. The idle release reclaims a channel left open.
+    /// the server refuses is `.hostFileUnreadable`. A timeout or a generic /
+    /// protocol SFTP failure condemns the client immediately so a concurrent
+    /// caller or immediate `Retry` opens a fresh `SSHSFTPClient`, while closing
+    /// the condemned client and releasing its lease once its last in-flight
+    /// reader finishes. The idle release reclaims a healthy channel left open.
     private func withHostFileClient<Value: Sendable>(
         path: String,
         _ operation: @escaping @Sendable (SSHSFTPClient) async throws -> Value
@@ -1211,22 +1271,15 @@ actor HeelerSSHTransport: Transport {
         if sftpRefusal.stands {
             throw TransportError.hostFeatureUnavailable(feature: String(localized: "Chat needs SFTP on the Host"))
         }
-        sessionFileClientIdleRelease?.cancel()
-        sessionFileClientIdleRelease = nil
-        sessionFileReadsInFlight += 1
-        defer {
-            sessionFileReadsInFlight -= 1
-            scheduleSessionFileClientIdleRelease()
-        }
+        let acquiredClientID = AcquiredSessionFileClientID()
         do {
             return try await AsyncDeadline.run(for: requestTimeout) {
-                let client = try await self.sessionFileClientForReading()
-                return try await operation(client)
+                try await self.runOnSessionFileClient(recordingIDInto: acquiredClientID, operation)
             }
         } catch {
             let (mapped, retiresChannel) = await mapHostFileError(error)
-            if retiresChannel, sessionFileReadsInFlight == 1 {
-                await releaseSessionFileClient()
+            if retiresChannel, let id = acquiredClientID.id {
+                await condemnSessionFileClient(id: id)
             }
             throw mapped
         }
@@ -1266,7 +1319,7 @@ actor HeelerSSHTransport: Transport {
         case AsyncDeadlineError.timedOut, SSHError.timedOut:
             (.hostFileTimedOut, true)
         case SSHError.sftpFailure(let status):
-            (.hostFileUnreadable(status: status), false)
+            (.hostFileUnreadable(status: status), retiresSFTPChannel(forStatus: status))
         case SSHError.sftpUnavailable:
             (.hostFeatureUnavailable(feature: String(localized: "Chat needs SFTP on the Host")), true)
         case is CancellationError, SSHError.cancelled, TransportError.cancelled:
@@ -1275,6 +1328,20 @@ actor HeelerSSHTransport: Transport {
             (error, true)
         default:
             nil
+        }
+    }
+
+    /// Generic `SSH_FX_FAILURE` (4) and channel/protocol SFTP errors (5..7, 9)
+    /// indicate a poisoned or broken `LIBSSH2_SFTP` handle (such as after a
+    /// concurrent request timed out or was cancelled mid-packet), whereas
+    /// file-level statuses like `SSH_FX_NO_SUCH_FILE` (2) and
+    /// `SSH_FX_PERMISSION_DENIED` (3) leave the channel healthy.
+    static func retiresSFTPChannel(forStatus status: UInt64) -> Bool {
+        switch status {
+        case 4, 5, 6, 7, 9:
+            true
+        default:
+            false
         }
     }
 
@@ -1393,22 +1460,36 @@ actor HeelerSSHTransport: Transport {
                 base: worktree.base,
                 branch: worktree.branch,
                 focus: false,
-                label: launch.name,
+                label: worktree.branch,
                 workspaceID: launch.workspaceID),
             decoding: WorktreeCreatedResponse.self)
         do {
+            let agent: Agent
             if launch.environmentParameter != nil {
-                return try await startAgentInEnvironmentTab(launch, worktree: created)
+                agent = try await startAgentInEnvironmentTab(launch, worktree: created)
+            } else {
+                let response = try await startAgentAwaitingShell(
+                    launch,
+                    paneID: created.rootPane.paneID)
+                if let tabLabel = launch.tabLabel {
+                    // A cosmetic rename must not fail an Agent that already started.
+                    try? await renameTab(
+                        TabRenameParams(label: tabLabel, tabID: created.tab.tabID))
+                }
+                agent = Agent(response.agent)
             }
-            let response = try await startAgentAwaitingShell(
-                launch,
-                paneID: created.rootPane.paneID)
-            if let tabLabel = launch.tabLabel {
-                // A cosmetic rename must not fail an Agent that already started.
-                try? await renameTab(
-                    TabRenameParams(label: tabLabel, tabID: created.tab.tabID))
+            if worktree.branch == nil,
+                let branch = created.worktree.branch,
+                created.workspace.label != branch
+            {
+                // A server-generated `worktree/<name>` branch arrives in the
+                // reply while herdr slugs the default workspace label; match it.
+                try? await renameWorkspace(
+                    WorkspaceRenameParams(
+                        label: branch,
+                        workspaceID: created.workspace.workspaceID))
             }
-            return Agent(response.agent)
+            return agent
         } catch let error as HerdrAPIError {
             try? await removeCreatedWorktree(workspaceID: created.workspace.workspaceID)
             throw error
@@ -1620,18 +1701,18 @@ actor HeelerSSHTransport: Transport {
     }
 
     func readSidebarLayout() async throws -> Data? {
-        try await readPluginConfigFile(named: Self.sidebarLayoutFileName)
+        try await readPluginConfigFile(named: Self.sidebarLayoutFileName, enforcesPermissions: false)
     }
 
     func readUsageAccountFile() async throws -> Data? {
-        try await readPluginConfigFile(named: UsageAccountFile.fileName)
+        try await readPluginConfigFile(named: UsageAccountFile.fileName, enforcesPermissions: false)
     }
 
     func replaceUsageAccountFile(_ contents: Data) async throws {
         try await replacePluginConfigFile(named: UsageAccountFile.fileName, contents: contents)
     }
 
-    private func readPluginConfigFile(named name: String) async throws -> Data? {
+    private func readPluginConfigFile(named name: String, enforcesPermissions: Bool = true) async throws -> Data? {
         try await withNotificationFileRequestDeadline {
             guard await self.notificationConnectionIsAvailable() else {
                 throw NotificationRegistrationError.readFailed(
@@ -1644,6 +1725,7 @@ actor HeelerSSHTransport: Transport {
                 try await self.performNotificationFileRead(
                     at: path,
                     configDirectory: directory,
+                    enforcesPermissions: enforcesPermissions,
                     operationID: operationID)
             }
         }
@@ -1676,6 +1758,7 @@ actor HeelerSSHTransport: Transport {
     private func performNotificationFileRead(
         at path: String,
         configDirectory: String,
+        enforcesPermissions: Bool = true,
         operationID: UUID
     ) async throws -> Data? {
         let sftp: SSHSFTPClient
@@ -1688,14 +1771,16 @@ actor HeelerSSHTransport: Transport {
 
         do {
             try Task.checkCancellation()
-            try await enforceNotificationPermissions(
-                0o700,
-                at: configDirectory,
-                over: sftp)
+            if enforcesPermissions {
+                try await enforceNotificationPermissions(
+                    0o700,
+                    at: configDirectory,
+                    over: sftp)
+            }
             let contents = try await sftp.readFileIfPresent(
                 at: path,
                 timeout: requestTimeout)
-            if contents != nil {
+            if enforcesPermissions, contents != nil {
                 try await enforceNotificationPermissions(0o600, at: path, over: sftp)
             }
             notificationFileClients[operationID] = nil
@@ -1928,6 +2013,8 @@ actor HeelerSSHTransport: Transport {
         at path: String,
         over sftp: SSHSFTPClient
     ) async throws {
+        let initial = try await sftp.attributes(at: path, timeout: requestTimeout)
+        if initial.permissions == permissions { return }
         try await sftp.setPermissions(permissions, at: path, timeout: requestTimeout)
         let attributes = try await sftp.attributes(at: path, timeout: requestTimeout)
         guard attributes.permissions == permissions else {
@@ -2389,6 +2476,16 @@ actor HeelerSSHTransport: Transport {
         _ source: StagingSource,
         progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
     ) async throws -> String {
+        // A Rex Host's Agent on native Windows gets its attachment over SFTP
+        // alone, in the account's own temp folder (ADR 0056's update of
+        // 2026-11-25): Rex has no counterpart of herdr-core's `terminal.put`,
+        // and the POSIX parent command cannot run there.
+        if servesRexHost {
+            let isWindows = try? await hostFileEnvironment().isWindows
+            if isWindowsHost || isWindows == true {
+                return try await stageOnWindows(source, progress: progress)
+            }
+        }
         try await requirePOSIXHost(feature: String(localized: "File and image uploads"))
         guard connected, await connection.isConnected else {
             throw AttachmentStagingError.transferFailed
@@ -2485,6 +2582,82 @@ actor HeelerSSHTransport: Transport {
         } catch {
             throw Task.isCancelled
                 ? AttachmentStagingError.cancelled : AttachmentStagingError.transferFailed
+        }
+    }
+
+    /// Stages `source` on a native Windows Rex Host over SFTP alone: a
+    /// `heeler.<random>` folder made once per connection under
+    /// `%USERPROFILE%\AppData\Local\Temp`, a `stage-<uuid>` folder in it, and
+    /// the file written as `.part` and renamed, as on POSIX. Windows keeps
+    /// no POSIX mode, so the folder is private by the temp folder's own ACL
+    /// rather than by a mode Heeler checks. Returns the Windows path the
+    /// Agent reads.
+    private func stageOnWindows(
+        _ source: StagingSource,
+        progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
+    ) async throws -> String {
+        guard connected, await connection.isConnected else {
+            throw AttachmentStagingError.transferFailed
+        }
+        let home: String
+        do {
+            home = RemoteFilePath.windowsForSFTP(try await hostFileEnvironment().home)
+        } catch {
+            throw AttachmentStagingError.remoteTemporaryDirectoryFailed
+        }
+        guard home.hasPrefix("/"), RemoteFilePath.isAcceptable(home) else {
+            throw AttachmentStagingError.remoteTemporaryDirectoryFailed
+        }
+        await progress(AttachmentStageProgress(transferredBytes: 0, totalBytes: source.byteCount))
+
+        let admitted: AdmittedStagingSFTPClient
+        if let idle = takeIdleStagingSFTPClient() {
+            admitted = idle
+        } else {
+            do {
+                admitted = try await openAdmittedStagingSFTPClient()
+            } catch let error as AttachmentStagingError {
+                throw error
+            } catch is CancellationError {
+                throw AttachmentStagingError.cancelled
+            } catch SSHError.sftpUnavailable {
+                throw AttachmentStagingError.sftpUnavailable
+            } catch {
+                if Task.isCancelled { throw AttachmentStagingError.cancelled }
+                throw AttachmentStagingError.transferFailed
+            }
+        }
+        let sftp = admitted.client
+        let operationID = UUID()
+        imageStageClients[operationID] = admitted
+        let timeout = requestTimeout
+        let files = WindowsStageUpload.Files(
+            makeDirectory: { try await sftp.createDirectory(at: $0, permissions: 0o700, timeout: timeout) },
+            write: { [self] path in
+                try await streamFile(
+                    at: source.fileURL, byteCount: source.byteCount, to: path, over: sftp,
+                    enforcesPermissions: false, progress: progress)
+            },
+            size: { try await sftp.attributes(at: $0, timeout: timeout).size },
+            rename: { try await sftp.renameFileAtomically(from: $0, to: $1, timeout: timeout) },
+            remove: { [self] path in await bestEffortRemoveRemoteFile(at: path, over: sftp) })
+        var upload = WindowsStageUpload(parent: cachedWindowsStageParentDirectory)
+        do {
+            let windowsPath = try await upload.stage(
+                source.remoteFilename, byteCount: source.byteCount, home: home, files: files)
+            cachedWindowsStageParentDirectory = upload.parent
+            imageStageClients[operationID] = nil
+            returnIdleStagingSFTPClient(admitted)
+            return windowsPath
+        } catch {
+            cachedWindowsStageParentDirectory = upload.parent
+            imageStageClients[operationID] = nil
+            try? await sftp.close(timeout: .seconds(2))
+            await admitted.lease.release()
+            if Task.isCancelled || error is CancellationError { throw AttachmentStagingError.cancelled }
+            if let stagingError = error as? AttachmentStagingError { throw stagingError }
+            if error as? SSHError == .sftpUnavailable { throw AttachmentStagingError.sftpUnavailable }
+            throw AttachmentStagingError.transferFailed
         }
     }
 
@@ -2697,6 +2870,7 @@ actor HeelerSSHTransport: Transport {
         byteCount: Int64,
         to remotePath: String,
         over sftp: SSHSFTPClient,
+        enforcesPermissions: Bool = true,
         progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
     ) async throws {
         let localFile: FileHandle
@@ -2712,7 +2886,9 @@ actor HeelerSSHTransport: Transport {
             permissions: 0o600,
             timeout: requestTimeout)
         do {
-            try await enforcePermissions(0o600, at: remotePath, over: sftp)
+            if enforcesPermissions {
+                try await enforcePermissions(0o600, at: remotePath, over: sftp)
+            }
 #if DEBUG
             await signalStagingPhaseForTesting(.payloadWriteReady)
 #endif
@@ -2808,10 +2984,7 @@ actor HeelerSSHTransport: Transport {
         notificationFileClients.removeAll()
         sessionFileClientIdleRelease?.cancel()
         sessionFileClientIdleRelease = nil
-        let fileReader = sessionFileClient
-        sessionFileClient = nil
-        let fileReaderLease = sessionFileClientLease
-        sessionFileClientLease = nil
+        let fileReaders = sessionFilePool.drainAll()
         for staging in stagingClients {
             try? await staging.client.close(timeout: .seconds(2))
             await staging.lease.release()
@@ -2819,10 +2992,10 @@ actor HeelerSSHTransport: Transport {
         for sftp in notificationClients {
             try? await sftp.close(timeout: .seconds(2))
         }
-        if let fileReader {
-            try? await fileReader.close(timeout: .seconds(2))
+        for reader in fileReaders {
+            try? await reader.client.close(timeout: .seconds(2))
+            await reader.lease.release()
         }
-        await fileReaderLease?.release()
         do {
             try await connection.close(timeout: .seconds(2))
         } catch {
@@ -2842,13 +3015,13 @@ actor HeelerSSHTransport: Transport {
         notificationFileClients.removeAll()
         sessionFileClientIdleRelease?.cancel()
         sessionFileClientIdleRelease = nil
-        sessionFileClient = nil
-        let fileReaderLease = sessionFileClientLease
-        sessionFileClientLease = nil
+        let fileReaders = sessionFilePool.drainAll()
         for staging in stagingClients {
             await staging.lease.release()
         }
-        await fileReaderLease?.release()
+        for reader in fileReaders {
+            await reader.lease.release()
+        }
         await connection.abort()
     }
 
@@ -3242,6 +3415,33 @@ actor HeelerSSHTransport: Transport {
         return try GitProbe.parseCommand(stdout: result.stdout, stderr: result.stderr, nonce: nonce)
     }
 
+    func exchangeAmpChat(_ request: AmpChatRequest, record: AmpPluginRecord) async throws -> AmpChatReply {
+        try requireConnected()
+        var input = try JSONEncoder().encode(request)
+        input.append(0x0A)
+        let line = input
+        let timeout = requestTimeout
+        let data: Data
+        do {
+            data = try await channelAdmission.withChannel(.ordinaryForwarding, priority: .interactive) {
+                try await self.connection.exchangeStreamLocal(
+                    socketPath: record.socket, request: line, maximumResponseBytes: 3 << 20, timeout: timeout)
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch { throw AmpChatProblem.unreachable }
+        return try JSONDecoder().decode(AmpChatReply.self, from: data)
+    }
+
+    func installAmpChatPlugin(in directory: String, replacing previous: Data?) async throws {
+        let contents = String(decoding: try AmpPluginLocation.bundledContents(), as: UTF8.self)
+        let result = try await runBoundedScript(
+            AmpPluginLocation.installScript(directory: directory, contents: contents, replacing: previous),
+            feature: String(localized: "Amp Chat"), deadline: .seconds(15), remoteSeconds: 10,
+            timeoutMarkerPrefix: "__HEELER_AMP_INSTALL_", timedOut: .hostFileTimedOut, priority: .interactive)
+        if result.exitStatus == 73 { throw AmpChatProblem.conflict }
+        guard result.exitStatus == 0 else { throw AmpChatProblem.unreachable }
+    }
+
     func queryOpenCode(_ query: OpenCodeQuery) async throws -> OpenCodeQueryResponse {
         try await queryOpenCode(query, reader: .automatic)
     }
@@ -3291,10 +3491,12 @@ actor HeelerSSHTransport: Transport {
     /// when the watchdog reports the feature's marker, the run throws the
     /// feature's `timedOut`. With a `lane`, a run waits for the previous one
     /// to drain, its wait counted against its own deadline.
+    /// `dispatched` hears when the exec is handed to SSH, after which the
+    /// script may have run whatever comes back.
     func runBoundedScript(
         _ script: Data, feature: String, deadline: Duration, remoteSeconds: Int64,
         timeoutMarkerPrefix: String, timedOut: TransportError, lane: GitExecGate? = nil,
-        priority: SSHChannelAdmission.Priority = .normal
+        priority: SSHChannelAdmission.Priority = .normal, dispatched: (@Sendable () -> Void)? = nil
     ) async throws -> GitExecResult {
         try await requirePOSIXHost(feature: feature)
         try requireConnected()
@@ -3314,6 +3516,7 @@ actor HeelerSSHTransport: Transport {
                     // Awaiting an unstructured task does not forward cancellation.
                     // Never cancel this task: its remote bound supplies the exit
                     // that lets libssh2 reclaim the channel without killing SSH.
+                    dispatched?()
                     let execution = Task.detached {
                         do {
                             return try await self.connection.execute(
@@ -3358,7 +3561,10 @@ actor HeelerSSHTransport: Transport {
     /// sshd gives each exec its own process group; non-interactive POSIX sh
     /// keeps its children in that group. The watchdog ends only this exec.
     /// Its marker descriptor is closed in sleep so a surviving timer cannot
-    /// hold an SSH output pipe open after normal script completion. Internal
+    /// hold an SSH output pipe open after normal script completion. A lost
+    /// connection or closed channel reaches the exec only as SIGPIPE at its
+    /// next write, so the watchdog ignores SIGPIPE: its marker write then
+    /// fails, and the kill still ends whatever the script started. Internal
     /// so a test can pin the bytes Changes sends.
     static func boundedScript(
         _ script: Data, remoteSeconds: Int64, timeoutMarker: String
@@ -3366,6 +3572,7 @@ actor HeelerSSHTransport: Transport {
         var input = Data("""
             {
             (
+                trap '' PIPE
                 sleep \(remoteSeconds) 3>&-
                 printf '\\n%s\\n' '\(timeoutMarker)' >&3
                 kill -KILL 0
@@ -4419,8 +4626,16 @@ extension HeelerSSHTransport: HerdrCoreHostConnection {
     }
 
     func readProcesses(_ request: HostProcessReader.Request) async throws -> [String: HostProcessReader.Facts] {
+        let platform = try await hostPlatform()
+        // A Rex Host's Chat reads a native Windows Host's processes as a core's
+        // does: one PowerShell exec, with no argv or open files (ADR 0034).
+        if servesRexHost, platform == .nativeWindows {
+            return try await HostProcessReader.readWindows(request) { [self] command in
+                try await runWindowsProcessRead(command)
+            }
+        }
         // Windows' existing reader does not expose argv. Unknown stays hidden.
-        guard try await hostPlatform() == .posix else { return [:] }
+        guard platform == .posix else { return [:] }
         let nonce = HostProcessReader.makeNonce()
         let result = try await runBoundedScript(
             HostProcessReader.script(request, nonce: nonce), feature: String(localized: "Agent permission modes"),
@@ -4429,6 +4644,15 @@ extension HeelerSSHTransport: HerdrCoreHostConnection {
             priority: .interactive)
         guard result.exitStatus == 0 else { return [:] }
         return try HostProcessReader.parse(stdout: result.stdout, nonce: nonce, request: request)
+    }
+
+    /// One bounded exec of a native Windows process read's command.
+    private func runWindowsProcessRead(_ command: String) async throws -> GitExecResult {
+        let bound = WindowsHostExec.processRead.bound
+        let result = try await withRequestDeadline(timeout: bound) {
+            try await self.runExec(command, timeout: bound, priority: .interactive)
+        }
+        return GitExecResult(stdout: result.stdout, stderr: result.stderr, exitStatus: result.exitStatus)
     }
 
     /// One bounded exec. A process read takes a shell, `od` and `awk`, or `perl`.
@@ -4493,6 +4717,36 @@ extension HeelerSSHTransport: RexHostConnection {
         }
     }
 
+    /// A native Windows server's control link: an exec of Rex's stdio bridge
+    /// (`RexWindowsDial`) under the events slot, as herdr-core's `connect` is.
+    /// A Windows pipe says the Host is native Windows, where each exec takes a
+    /// `MaxSessions` slot that a Unix socket's channel does not, so the
+    /// connection keeps under the Windows session budget from here.
+    func openRexControlExec(command: String) async throws -> any HeelerSSHAPIChannel {
+        guard connected else {
+            throw TransportError.sshUnreachable(detail: String(localized: "The SSH connection is closed."))
+        }
+        await configureWindowsHost()
+        return try await channelAdmission.admitCoreLink {
+            BootstrappedExecChannel(
+                channel: try await self.openCoreExec(command: command),
+                startupFailure: String(localized: "The command that reaches Rex did not start."))
+        }
+    }
+
+    /// A native Windows server's data link, the same exec under an attach slot.
+    func openRexDataExec(command: String) async throws -> any HeelerSSHAPIChannel {
+        guard connected else {
+            throw TransportError.sshUnreachable(detail: String(localized: "The SSH connection is closed."))
+        }
+        await configureWindowsHost()
+        return try await channelAdmission.admitAttachLink {
+            BootstrappedExecChannel(
+                channel: try await self.openCoreExec(command: command),
+                startupFailure: String(localized: "The command that reaches Rex did not start."))
+        }
+    }
+
     /// One bounded exec that tests a file and lists sockets.
     func runRexSocketCheck(_ script: Data) async throws -> GitExecResult {
         try await runBoundedScript(
@@ -4515,6 +4769,134 @@ extension HeelerSSHTransport: RexHostConnection {
         try await replaceHostHelperFile(
             contents, at: "\(folder)/\(HostHelperScript.extensionFileName)", privateDirectory: nil)
     }
+}
+
+// MARK: - gh on the Host (ADR 0065)
+extension HeelerSSHTransport {
+    /// One bounded exec, whatever Server Kind the connection serves. The
+    /// remote bound leaves room for a run in the exec and one in the
+    /// desktop session after it; a run past it is not sent again. A write
+    /// that fails once its exec was handed to SSH may have run, as a
+    /// herdr-core mutation may, and says so.
+    func runGitHubScript(_ script: Data, isMutation: Bool) async throws -> GitExecResult {
+        let handedOver = GitHubExecHandover()
+        do {
+            return try await runBoundedScript(
+                script, feature: String(localized: "GitHub"), deadline: .seconds(60),
+                remoteSeconds: GitHubCLIScript.execSeconds,
+                timeoutMarkerPrefix: "__HEELER_GH_TIMEOUT_", timedOut: .hostFileTimedOut,
+                dispatched: { handedOver.mark() })
+        } catch TransportError.hostFileTimedOut {
+            // Already an unknown outcome for a write, and it says why.
+            throw TransportError.hostFileTimedOut
+        } catch where isMutation && handedOver.isMarked {
+            throw TransportError.coreMutationOutcomeUnknown
+        }
+    }
+}
+
+/// Tracks the shared session-file SFTP client and any condemned predecessors
+/// still draining in-flight operations so a concurrent timeout or channel/SFTP
+/// protocol failure immediately isolates the broken handle from subsequent
+/// callers (`Retry` included) without releasing its admission lease early.
+struct SessionFileClientPool<Client: Sendable> {
+    struct Entry {
+        let id: UInt64
+        let client: Client
+        let lease: SSHChannelAdmissionLease
+        var readsInFlight = 0
+        var isCondemned = false
+    }
+
+    private var nextID: UInt64 = 0
+    private(set) var currentID: UInt64?
+    private var entries: [UInt64: Entry] = [:]
+
+    var entryCount: Int { entries.count }
+
+    mutating func acquireCurrent() -> (id: UInt64, client: Client)? {
+        guard let id = currentID, var entry = entries[id], !entry.isCondemned else {
+            return nil
+        }
+        entry.readsInFlight += 1
+        entries[id] = entry
+        return (id, entry.client)
+    }
+
+    @discardableResult
+    mutating func install(client: Client, lease: SSHChannelAdmissionLease) -> UInt64 {
+        nextID &+= 1
+        let id = nextID
+        entries[id] = Entry(id: id, client: client, lease: lease)
+        currentID = id
+        return id
+    }
+
+    func isCurrentIdle(_ id: UInt64) -> Bool {
+        guard currentID == id, let entry = entries[id] else { return false }
+        return !entry.isCondemned && entry.readsInFlight == 0
+    }
+
+    mutating func condemn(id: UInt64) -> Entry? {
+        guard var entry = entries[id] else { return nil }
+        entry.isCondemned = true
+        if currentID == id {
+            currentID = nil
+        }
+        if entry.readsInFlight == 0 {
+            entries.removeValue(forKey: id)
+            return entry
+        }
+        entries[id] = entry
+        return nil
+    }
+
+    mutating func finishRead(
+        id: UInt64,
+        retiresChannel: Bool
+    ) -> (retired: Entry?, becameIdleCurrentID: UInt64?) {
+        guard var entry = entries[id] else { return (nil, nil) }
+        entry.readsInFlight = max(0, entry.readsInFlight - 1)
+        if retiresChannel {
+            entry.isCondemned = true
+            if currentID == id {
+                currentID = nil
+            }
+        }
+        if entry.isCondemned {
+            if entry.readsInFlight == 0 {
+                entries.removeValue(forKey: id)
+                return (entry, nil)
+            }
+            entries[id] = entry
+            return (nil, nil)
+        }
+        entries[id] = entry
+        let idleID = (currentID == id && entry.readsInFlight == 0) ? id : nil
+        return (nil, idleID)
+    }
+
+    mutating func takeIfIdle(id: UInt64) -> Entry? {
+        guard isCurrentIdle(id) else { return nil }
+        currentID = nil
+        return entries.removeValue(forKey: id)
+    }
+
+    mutating func drainAll() -> [Entry] {
+        currentID = nil
+        let drained = Array(entries.values)
+        entries.removeAll()
+        return drained
+    }
+}
+
+/// Whether a gh exec reached SSH, which decides what its failure means.
+private final class GitHubExecHandover: Sendable {
+    private let marked = Mutex(false)
+
+    func mark() { marked.withLock { $0 = true } }
+
+    var isMarked: Bool { marked.withLock { $0 } }
 }
 
 // MARK: - What a port preview uses of this connection

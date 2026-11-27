@@ -62,7 +62,7 @@ struct RexTransportTests {
         (["kernel Darwin", "installed"], TransportError.rexServerNotRunning(socketPath: nil)),
         (["kernel Darwin"], .rexNotInstalled),
         (["kernel Linux", "socket 0 0 /run/rex/server.sock", "installed"], .rexAccountRefused(socketPath: "/run/rex/server.sock")),
-        (["kernel FreeBSD"], .rexLookupFailed(reason: "Heeler finds Rex on macOS and Linux Hosts only.")),
+        (["kernel FreeBSD"], .rexLookupFailed(reason: "Heeler finds Rex on macOS, Linux and Windows Hosts only.")),
     ])
     func aLookupThatFindsNoUsableSocketSaysWhy(probe: [String], expected: TransportError) async {
         let host = ScriptedRexHost(probe: probe)
@@ -115,14 +115,14 @@ struct RexTransportTests {
 
     @Test func anotherRevisionNamesWhatTheServerOffered() async {
         var welcome = FakeRexServer.Welcome()
-        welcome.apiRevision = 13
-        welcome.serverRevision = 14
+        welcome.apiRevision = 20
+        welcome.serverRevision = 21
         let server = FakeRexServer()
         let host = ScriptedRexHost(control: [.server(server, welcome: welcome)])
 
         let error = await failure(host)
 
-        #expect(error as? TransportError == .rexUnsupportedRevision(offered: 14))
+        #expect(error as? TransportError == .rexUnsupportedRevision(offered: 21))
         #expect(await server.clientClose?.code == .normalClosure)
     }
 
@@ -157,6 +157,75 @@ struct RexTransportTests {
         #expect(await !oldServer.clientSentCloseFrame)
         #expect(await host.log == ["control \(Self.path)", "control \(Self.path)"])
         await transport.close()
+    }
+
+    // MARK: Native Windows
+
+    static let pipe = "npipe:////./pipe/rex-S-1-5-21-1111111111-2222222222-3333333333-1001"
+    static let dial = "cmd /d /c \"echo __HEELER_STREAM_READY__&& cd /d %USERPROFILE%&& rex.exe -S \(pipe) __internal dial-stdio --autostart=false\""
+
+    /// SSH forwards no named pipe: the control and data links are execs of
+    /// Rex's stdio bridge, carrying the same WebSocket.
+    @Test func aWindowsPipeIsReachedThroughRexsStdioBridge() async throws {
+        let server = FakeRexServer()
+        let endpoint = FakeRexDataEndpoint()
+        let host = ScriptedRexHost(control: [.server(server)], data: [.endpoint(endpoint)], platform: .nativeWindows)
+
+        let transport = try await connect(host, socket: RexSocket(path: Self.pipe))
+        #expect(await server.nextHello()["api_revision"] == .number(19))
+        _ = try await transport.openDataChannel()
+
+        #expect(await host.log == ["control exec \(Self.dial)", "data exec \(Self.dial)"])
+        await transport.close()
+    }
+
+    /// A Windows Host that stores no pipe looks for it with the Windows probe.
+    @Test func aWindowsHostWithoutAPipeLooksItUp() async throws {
+        let host = ScriptedRexHost(
+            probe: ScriptedRexHost.probeFinding(Self.pipe, kernel: "Windows"), control: [.server(FakeRexServer())],
+            platform: .nativeWindows)
+
+        let transport = try await connect(host, socket: nil)
+
+        #expect(transport.foundSocket == RexSocket(path: Self.pipe))
+        #expect(await host.log == ["windows", "control exec \(Self.dial)"])
+        await transport.close()
+    }
+
+    /// The bridge ends before the upgrade when no server listens (it starts
+    /// none) or `rex` is not on PATH; a fresh look says which.
+    @Test(arguments: [
+        (["kernel Windows", "installed"], TransportError.rexServerNotRunning(socketPath: pipe)),
+        (["kernel Windows"], .rexNotInstalled),
+        (["kernel Windows", "socket 1 0 \(pipe)", "installed"],
+         .rexLookupFailed(reason: "Rex is running, but rex.exe is not on the PATH of this account's SSH sessions.")),
+    ])
+    func aWindowsBridgeThatEndsSaysWhy(probe: [String], expected: TransportError) async {
+        let host = ScriptedRexHost(probe: probe, control: [.endsAtOnce], platform: .nativeWindows)
+
+        let error = await failure(host, socket: RexSocket(path: Self.pipe))
+
+        #expect(error as? TransportError == expected)
+        #expect(await host.log == ["control exec \(Self.dial)", "windows", "close"])
+    }
+
+    /// A pipe found while `rex.exe` is not on the exec's PATH is no server
+    /// the bridge can reach, and the lookup says so.
+    @Test func aWindowsPipeWithoutRexOnPathSaysSo() async {
+        let host = ScriptedRexHost(
+            probe: ["kernel Windows", "socket 1 0 \(Self.pipe)", "installed"], platform: .nativeWindows)
+
+        let error = await failure(host, socket: nil)
+
+        #expect(
+            error as? TransportError
+                == .rexLookupFailed(reason: "Rex is running, but rex.exe is not on the PATH of this account's SSH sessions."))
+        #expect(await host.log == ["windows", "close"])
+    }
+
+    @Test func aWindowsServersPlatformNamesItsKernel() {
+        #expect(RexServerPlatform.kernel(reading: ["platform": "windows_amd64"]) == HerdrCoreLocator.windowsKernel)
+        #expect(RexServerPlatform.kernel(reading: ["platform": "darwin_arm64"]) == HerdrCoreLocator.macOSKernel)
     }
 
     @Test func aDataChannelGoesToTheSameSocket() async throws {
@@ -199,10 +268,10 @@ struct RexTransportTests {
         #expect(forwarding.detail?.contains("Rex is running") == true)
 
         #expect(TransportError.rexAccountRefused(socketPath: nil).presentation.summary == "Rex did not let this account in")
-        let newer = TransportError.rexUnsupportedRevision(offered: 14).presentation.message
-        #expect(newer.contains("14") && newer.contains("revision 12") && newer.contains("Update Heeler"))
+        let newer = TransportError.rexUnsupportedRevision(offered: 21).presentation.message
+        #expect(newer.contains("21") && newer.contains("revisions 12 to 19") && newer.contains("Update Heeler"))
         #expect(TransportError.rexUnsupportedRevision(offered: 11).presentation.message.contains("Update Rex"))
-        #expect(TransportError.rexUnsupportedRevision(offered: nil).presentation.message.contains("revision 12"))
+        #expect(TransportError.rexUnsupportedRevision(offered: nil).presentation.message.contains("12 to 19"))
 
         #expect(TransportError.rexServerNotRunning(socketPath: nil).isRetryable)
         #expect(TransportError.rexSocketUnreachable(socketPath: Self.path).isRetryable)

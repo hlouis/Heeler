@@ -1,4 +1,5 @@
 import Foundation
+import HeelerSSH
 import Testing
 
 @testable import Heeler
@@ -17,10 +18,11 @@ struct AgentChatStoreTests {
     }
 
     private static func agent(
-        session: String?, status: AgentStatus = .idle, program: ChatProgram = .claude
+        session: String?, status: AgentStatus = .idle, program: ChatProgram = .claude,
+        terminalID: String = "term-1"
     ) -> Agent {
         Agent(
-            terminalID: "term-1", kind: program.rawValue, title: "", status: status, workspaceID: "w1",
+            terminalID: terminalID, kind: program.rawValue, title: "", status: status, workspaceID: "w1",
             tabID: "t1", paneID: "w1:p1", cwd: cwd, revision: 1,
             agentSession: session.map {
                 AgentSessionInfo(
@@ -106,6 +108,7 @@ struct AgentChatStoreTests {
         ///   - heldStatus: holds a file status the store asks for once armed.
         init(
             session: String?, program: ChatProgram = .claude,
+            terminalID: String = "term-1",
             limits: TranscriptFollower.Limits = TranscriptFollower.Limits(),
             timing: AgentChatStore.Timing = AgentChatStore.Timing(
                 activeInterval: .milliseconds(5), idleInterval: .milliseconds(5)),
@@ -113,10 +116,11 @@ struct AgentChatStoreTests {
             cachedSession: @escaping @Sendable (Agent) async -> AgentSessionInfo? = { _ in nil },
             screen: BlockedScreenIO = .unavailable,
             processInfo: (@Sendable () async throws -> PaneProcessInfo)? = nil,
+            dismissedLaunchNotices: ChatLaunchNoticeDismissalStore = ChatLaunchNoticeDismissalStore(defaults: nil),
             heldStatus: HeldStatus? = nil,
             onRunningBackgroundWorkChanged: (@MainActor @Sendable (Bool) -> Void)? = nil
         ) {
-            let agent = AgentChatStoreTests.agent(session: session, program: program)
+            let agent = AgentChatStoreTests.agent(session: session, program: program, terminalID: terminalID)
             let server = Server(agent)
             let clock = clock
             self.server = server
@@ -140,6 +144,7 @@ struct AgentChatStoreTests {
                     adapter: adapter ?? NumberedChatReducer.adapter(limits: limits, wantsFirstLine: program == .codex),
                     cachedSession: cachedSession, processInfo: processInfo, screen: screen,
                     onRunningBackgroundWorkChanged: onRunningBackgroundWorkChanged),
+                dismissedLaunchNotices: dismissedLaunchNotices,
                 timing: timing, now: { clock.now })
         }
 
@@ -648,12 +653,17 @@ struct AgentChatStoreTests {
 
         let conversation = fixture.store.conversation
         #expect(conversation.phase == .locating)
+        #expect(conversation.readFailure != nil)
         #expect(conversation.transcript.entries.isEmpty)
         #expect(
             ChatSurfacePresentation(conversation: conversation, hasPendingEchoes: false, isHostConnected: false)
                 == .awaitingHost)
         #expect(
             ChatSurfacePresentation(conversation: conversation, hasPendingEchoes: false, isHostConnected: true)
+                == .readFailed)
+        #expect(
+            ChatSurfacePresentation(
+                conversation: Self.snapshot(.locating), hasPendingEchoes: false, isHostConnected: true)
                 == .locating)
     }
 
@@ -1230,11 +1240,15 @@ struct AgentChatStoreTests {
     private static let controlSocket = "/home/dev/.codex/app-server-control/app-server-control.sock"
 
     private static func launched(
-        _ arguments: [String], session: String? = nil, program: ChatProgram = .codex, serverRuns: Bool = true
+        _ arguments: [String], session: String? = nil, program: ChatProgram = .codex, serverRuns: Bool = true,
+        terminalID: String = "term-1",
+        dismissedLaunchNotices: ChatLaunchNoticeDismissalStore = ChatLaunchNoticeDismissalStore(defaults: nil)
     ) async -> (fixture: Fixture, processes: Processes) {
         let processes = Processes(arguments)
         let fixture = Fixture(
-            session: session, program: program, processInfo: { try await processes.readSuspending() })
+            session: session, program: program, terminalID: terminalID,
+            processInfo: { try await processes.readSuspending() },
+            dismissedLaunchNotices: dismissedLaunchNotices)
         if serverRuns { await fixture.files.write("", at: controlSocket) }
         return (fixture, processes)
     }
@@ -1316,11 +1330,156 @@ struct AgentChatStoreTests {
 
         #expect(fixture.store.conversation.phase == .following(path: transcript))
         #expect(fixture.store.launchNotice == .codexSharedServer)
+        #expect(fixture.store.visibleLaunchNotice == .codexSharedServer)
         let lines = ChatBannerLine.lines(
             hostStatus: .connected, conversation: fixture.store.conversation, hasPendingEchoes: false,
-            launchNotice: fixture.store.launchNotice)
+            launchNotice: fixture.store.visibleLaunchNotice)
         #expect(lines == [.launch(.codexSharedServer)])
         #expect(lines.first?.text == "This may be another terminal's conversation.")
+    }
+
+    @Test func dismissingTheLaunchNoticeHidesTheBannerUntilTheNoticeClearsAndReturns() async {
+        let session = "01a10f87-e025-7fb1-8974-8dd09937767a"
+        let transcript = "/home/dev/.codex/sessions/2026/10/06/rollout-2026-10-06T12-45-25-\(session).jsonl"
+        let (fixture, processes) = await Self.launched(["codex", "resume", session], session: session)
+        await fixture.files.write(
+            #"{"type":"session_meta","payload":{"id":"\#(session)"}}"# + "\n" + NumberedChatReducer.lines(0..<2),
+            at: transcript)
+        Self.showWithoutLoop(fixture.store)
+        await fixture.store.step()
+        #expect(fixture.store.visibleLaunchNotice == .codexSharedServer)
+
+        fixture.store.dismissLaunchNotice()
+        #expect(fixture.store.launchNotice == .codexSharedServer)
+        #expect(fixture.store.visibleLaunchNotice == nil)
+        #expect(
+            ChatBannerLine.lines(
+                hostStatus: .connected, conversation: fixture.store.conversation, hasPendingEchoes: false,
+                launchNotice: fixture.store.visibleLaunchNotice
+            ).isEmpty)
+
+        // Dismissed notices stop periodic rechecks and stay hidden across
+        // explicit rechecks while Codex remains on the shared server.
+        fixture.advance(10)
+        await fixture.store.step()
+        #expect(await processes.reads == 1)
+
+        fixture.store.retry()
+        await fixture.store.step()
+        #expect(await processes.reads == 2)
+        #expect(fixture.store.launchNotice == .codexSharedServer)
+        #expect(fixture.store.visibleLaunchNotice == nil)
+
+        // Restarting Codex with --no-daemon clears both the notice and its
+        // dismissal, so a later shared-server launch warns again.
+        await processes.set(["codex", "--no-daemon", "resume", session])
+        fixture.store.agentDidChange(Self.agent(session: session, status: .working, program: .codex))
+        await fixture.store.step()
+        #expect(fixture.store.launchNotice == nil)
+        #expect(fixture.store.visibleLaunchNotice == nil)
+
+        await processes.set(["codex", "resume", session])
+        fixture.store.agentDidChange(Self.agent(session: session, status: .idle, program: .codex))
+        await fixture.store.step()
+        #expect(fixture.store.launchNotice == .codexSharedServer)
+        #expect(fixture.store.visibleLaunchNotice == .codexSharedServer)
+    }
+
+    @Test func aNewAgentIdentityClearsADismissedLaunchNotice() async {
+        let (fixture, _) = await Self.launched(["codex"])
+        Self.showWithoutLoop(fixture.store)
+        await fixture.store.step()
+        #expect(fixture.store.visibleLaunchNotice == .codexSharedServer)
+
+        fixture.store.dismissLaunchNotice()
+        #expect(fixture.store.visibleLaunchNotice == nil)
+
+        let current = Self.agent(session: nil, status: .idle, program: .codex)
+        let replacement = Agent(
+            terminalID: "term-2", kind: current.kind, title: current.title, status: current.status,
+            workspaceID: current.workspaceID, tabID: current.tabID, paneID: current.paneID,
+            cwd: current.cwd, revision: current.revision + 1, agentSession: current.agentSession)
+        fixture.store.agentDidChange(replacement)
+        await fixture.store.step()
+        #expect(fixture.store.visibleLaunchNotice == .codexSharedServer)
+    }
+
+    @Test func dismissingTheLaunchNoticePersistsForTheSameTerminalAndClearsWhenResolved() async {
+        let suiteName = "AgentChatStoreTests.launchNotice.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let firstStore = ChatLaunchNoticeDismissalStore(defaults: defaults)
+        let (first, _) = await Self.launched(["codex"], terminalID: "term-persist", dismissedLaunchNotices: firstStore)
+        Self.showWithoutLoop(first.store)
+        await first.store.step()
+        #expect(first.store.visibleLaunchNotice == .codexSharedServer)
+
+        first.store.dismissLaunchNotice()
+        #expect(first.store.visibleLaunchNotice == nil)
+
+        // Simulating an app restart: a newly loaded store keeps the same
+        // terminal's banner dismissed, while another terminal still warns.
+        let reloaded = ChatLaunchNoticeDismissalStore(defaults: defaults)
+        let (sameTerminal, sameProcesses) = await Self.launched(
+            ["codex"], terminalID: "term-persist", dismissedLaunchNotices: reloaded)
+        Self.showWithoutLoop(sameTerminal.store)
+        await sameTerminal.store.step()
+        #expect(sameTerminal.store.launchNotice == .codexSharedServer)
+        #expect(sameTerminal.store.visibleLaunchNotice == nil)
+
+        let (otherTerminal, _) = await Self.launched(
+            ["codex"], terminalID: "term-other", dismissedLaunchNotices: reloaded)
+        Self.showWithoutLoop(otherTerminal.store)
+        await otherTerminal.store.step()
+        #expect(otherTerminal.store.visibleLaunchNotice == .codexSharedServer)
+
+        // Restarting the dismissed terminal with --no-daemon clears its
+        // persisted record from UserDefaults as well.
+        await sameProcesses.set(["codex", "--no-daemon"])
+        sameTerminal.store.agentDidChange(
+            Self.agent(session: nil, status: .working, program: .codex, terminalID: "term-persist"))
+        await sameTerminal.store.step()
+        #expect(sameTerminal.store.launchNotice == nil)
+        #expect(defaults.object(forKey: ChatLaunchNoticeDismissalStore.defaultsKey) == nil)
+    }
+
+    @Test func launchNoticeDismissalStorePrunesRemovedHostsTerminalsAndCapsEntries() {
+        let suiteName = "AgentChatStoreTests.launchNoticePrune.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let hostA = UUID()
+        let hostB = UUID()
+        let store = ChatLaunchNoticeDismissalStore(defaults: defaults)
+        store.dismiss(.codexSharedServer, hostID: hostA, terminalID: "a-1")
+        store.dismiss(.codexSharedServer, hostID: hostA, terminalID: "a-2")
+        store.dismiss(.codexSharedServer, hostID: hostB, terminalID: "b-1")
+
+        store.retainTerminals(hostID: hostA, terminalIDs: ["a-2"])
+        #expect(store.dismissedNotice(hostID: hostA, terminalID: "a-1") == nil)
+        #expect(store.dismissedNotice(hostID: hostA, terminalID: "a-2") == .codexSharedServer)
+        #expect(store.dismissedNotice(hostID: hostB, terminalID: "b-1") == .codexSharedServer)
+
+        store.retainHosts([hostA])
+        #expect(!store.hasEntries(for: hostB))
+        #expect(store.dismissedNotice(hostID: hostB, terminalID: "b-1") == nil)
+
+        store.removeHost(hostA)
+        #expect(store.isEmpty)
+        #expect(defaults.object(forKey: ChatLaunchNoticeDismissalStore.defaultsKey) == nil)
+
+        for i in 0..<(ChatLaunchNoticeDismissalStore.maxEntries + 5) {
+            store.dismiss(.codexSharedServer, hostID: hostA, terminalID: "term-\(i)")
+        }
+        let reloaded = ChatLaunchNoticeDismissalStore(defaults: defaults)
+        #expect(reloaded.dismissedNotice(hostID: hostA, terminalID: "term-0") == nil)
+        #expect(reloaded.dismissedNotice(hostID: hostA, terminalID: "term-4") == nil)
+        #expect(reloaded.dismissedNotice(hostID: hostA, terminalID: "term-5") == .codexSharedServer)
+        #expect(
+            reloaded.dismissedNotice(
+                hostID: hostA, terminalID: "term-\(ChatLaunchNoticeDismissalStore.maxEntries + 4)")
+                == .codexSharedServer)
     }
 
     @Test(arguments: [
@@ -4938,6 +5097,176 @@ struct AgentChatStoreTests {
 
         #expect(fixture.store.conversation.phase == .following(path: Self.path(Self.first)))
         #expect(fixture.store.conversation.transcript.entries.count == 2)
+    }
+
+    @Test func aLocatingReadFailureShowsRetryBannerWithoutLocatingSpinnerOrFalseEmptyState() {
+        for failure: TransportError in [.hostFileTimedOut, .hostFileUnreadable(status: 4)] {
+            var locating = Self.snapshot(.locating)
+            locating.readFailure = failure
+            #expect(
+                ChatBannerLine.lines(hostStatus: .connected, conversation: locating, hasPendingEchoes: false)
+                    == [.readFailure(failure)])
+            let locatingSurface = ChatSurfacePresentation(
+                conversation: locating, hasPendingEchoes: false, isHostConnected: true)
+            #expect(locatingSurface == .readFailed)
+            #expect(locatingSurface != .locating)
+            #expect(locatingSurface != .empty)
+
+            var followingFailedEmpty = Self.snapshot(.following(path: "/p.jsonl"))
+            followingFailedEmpty.readFailure = failure
+            #expect(
+                ChatSurfacePresentation(
+                    conversation: followingFailedEmpty, hasPendingEchoes: false, isHostConnected: true)
+                    == .readFailed)
+
+            var codexWaiting = Self.snapshot(.unavailable(.noSession(.codex)))
+            codexWaiting.readFailure = failure
+            #expect(
+                ChatSurfacePresentation(
+                    conversation: codexWaiting, hasPendingEchoes: false, isHostConnected: true, checkingLaunch: true)
+                    == .unavailable(.noSession(.codex)))
+        }
+
+        let cleanLocating = Self.snapshot(.locating)
+        #expect(
+            ChatSurfacePresentation(conversation: cleanLocating, hasPendingEchoes: false, isHostConnected: true)
+                == .locating)
+        let cleanFollowingEmpty = Self.snapshot(.following(path: "/p.jsonl"))
+        #expect(
+            ChatSurfacePresentation(
+                conversation: cleanFollowingEmpty, hasPendingEchoes: false, isHostConnected: true)
+                == .empty)
+    }
+
+    @Test func aProcessBoundSessionCheckFailureRecoversAutomaticallyWithoutManualRetry() async throws {
+        actor EvidenceBox {
+            var failure: TransportError? = .hostFileUnreadable(status: 3)
+            var reads = 0
+            let sessionID: String
+
+            init(sessionID: String) {
+                self.sessionID = sessionID
+            }
+
+            func setFailure(_ next: TransportError?) {
+                failure = next
+            }
+
+            func check() throws -> ChatSessionEvidence {
+                reads += 1
+                if let failure { throw failure }
+                return .bound(sessionID: sessionID, transcriptRoot: "/home/dev/.claude", directory: "/home/dev/proj")
+            }
+        }
+
+        let files = VirtualHostFiles()
+        await files.write(NumberedChatReducer.lines(0..<3), at: Self.path(Self.first))
+        let clock = Clock()
+        let evidence = EvidenceBox(sessionID: Self.first)
+        let agent = Self.agent(session: nil, program: .claude)
+        let store = AgentChatStore(
+            agentID: ConsoleAgent.ID(hostID: Self.host, paneID: agent.paneID),
+            agent: agent,
+            program: .claude,
+            source: AgentChatSource(
+                hostID: Self.host,
+                socketLocation: .defaultSession,
+                files: files.hostFiles(),
+                agentInfo: { agent },
+                cache: VolatileChatTranscriptCache(),
+                adapter: NumberedChatReducer.adapter(),
+                sessionEvidence: { try await evidence.check() },
+                coreScope: "core-1"),
+            timing: AgentChatStore.Timing(
+                activeInterval: .milliseconds(5), idleInterval: .milliseconds(5), sessionRecheck: 5),
+            now: { clock.now })
+
+        await store.step()
+        #expect(store.conversation.readFailure == .hostFileUnreadable(status: 3))
+        #expect(await evidence.reads == 1)
+
+        // Before `sessionRecheck` elapses, no tight-loop recheck runs.
+        clock.now = clock.now.addingTimeInterval(2)
+        await store.step()
+        #expect(await evidence.reads == 1)
+
+        // Once permissions / SFTP recover (`chmod 644`), the next periodic recheck clears
+        // `readFailure` and opens the conversation without requiring manual `Retry`.
+        await evidence.setFailure(nil)
+        clock.now = clock.now.addingTimeInterval(4)
+        await store.step()
+
+        #expect(await evidence.reads == 2)
+        #expect(store.conversation.readFailure == nil)
+        #expect(store.conversation.phase == .following(path: Self.path(Self.first)))
+        #expect(Self.ids(store) == NumberedChatReducer.ids(0..<3))
+    }
+
+    @Test func sessionFileClientPoolRetiresCondemnedClientOnConcurrentTimeoutAndStatus4() async throws {
+        func failure(_ error: any Error) -> (TransportError, Bool)? {
+            HeelerSSHTransport.hostFileFailure(for: error).map { ($0.error, $0.retiresChannel) }
+        }
+        #expect(failure(AsyncDeadlineError.timedOut)! == (.hostFileTimedOut, true))
+        #expect(failure(SSHError.sftpFailure(status: 4))! == (.hostFileUnreadable(status: 4), true))
+        #expect(failure(SSHError.sftpFailure(status: 5))! == (.hostFileUnreadable(status: 5), true))
+        #expect(failure(SSHError.sftpFailure(status: 2))! == (.hostFileUnreadable(status: 2), false))
+        #expect(failure(SSHError.sftpFailure(status: 3))! == (.hostFileUnreadable(status: 3), false))
+
+        let admission = SSHChannelAdmission()
+        let lease1 = try await admission.acquire(.ordinarySession, priority: .interactive)
+        let lease2 = try await admission.acquire(.ordinarySession, priority: .interactive)
+        var pool = SessionFileClientPool<Int>()
+
+        let installed1 = pool.install(client: 101, lease: lease1)
+        let acquiredA = pool.acquireCurrent()
+        let acquiredB = pool.acquireCurrent()
+        let readerA = try #require(acquiredA)
+        let readerB = try #require(acquiredB)
+        #expect(readerA.id == installed1 && readerA.client == 101)
+        #expect(readerB.id == installed1 && readerB.client == 101)
+
+        // Reader A times out while Reader B (`chat.prefetch`) is still in flight (`readsInFlight == 2`):
+        // client 101 is condemned immediately so `Retry` opens a fresh client, while lease1 stays held
+        // until both in-flight operations exit.
+        #expect(pool.condemn(id: readerA.id) == nil)
+        #expect(pool.currentID == nil)
+        #expect(pool.acquireCurrent() == nil)
+
+        // Immediate `Retry` installs and acquires fresh client 102 before Reader A/B finish unwinding.
+        let installed2 = pool.install(client: 102, lease: lease2)
+        let acquiredRetry = pool.acquireCurrent()
+        let retryReader = try #require(acquiredRetry)
+        #expect(retryReader.id == installed2 && retryReader.client == 102)
+
+        // Reader A unwinds cancellation; Reader B is still running on condemned client 101.
+        #expect(pool.finishRead(id: readerA.id, retiresChannel: false).retired == nil)
+        #expect(pool.entryCount == 2)
+
+        // Reader B finishes -> condemned client 101 is finally returned for close + lease release.
+        let retired1 = pool.finishRead(id: readerB.id, retiresChannel: false).retired
+        #expect(retired1?.client == 101)
+        await retired1?.lease.release()
+        #expect(pool.entryCount == 1)
+        #expect(pool.currentID == installed2)
+
+        // Benign file-level status (`status 3`, `retiresChannel: false`) preserves client 102.
+        let benignOutcome = pool.finishRead(id: retryReader.id, retiresChannel: false)
+        #expect(benignOutcome.retired == nil)
+        #expect(benignOutcome.becameIdleCurrentID == installed2)
+        #expect(pool.isCurrentIdle(installed2))
+
+        // Generic `SSH_FX_FAILURE` (`status 4`, `retiresChannel: true`) under concurrency retires 102.
+        let acquiredC = pool.acquireCurrent()
+        let acquiredD = pool.acquireCurrent()
+        let readerC = try #require(acquiredC)
+        let readerD = try #require(acquiredD)
+        #expect(pool.finishRead(id: readerC.id, retiresChannel: true).retired == nil)
+        #expect(pool.currentID == nil)
+        #expect(pool.acquireCurrent() == nil)
+        let retired2 = pool.finishRead(id: readerD.id, retiresChannel: false).retired
+        #expect(retired2?.client == 102)
+        await retired2?.lease.release()
+        #expect(pool.entryCount == 0)
     }
 
     private static func savedIDs(_ cache: VolatileChatTranscriptCache, _ key: ChatCacheKey) async -> [String] {

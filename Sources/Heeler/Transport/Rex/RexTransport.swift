@@ -53,6 +53,14 @@ protocol RexTransport: Sendable {
     /// of it.
     nonisolated var extensionPlacing: any RexHostExtensionPlacing { get }
 
+    /// The gh runs of the GitHub tab, on this same SSH connection, and
+    /// nothing else of it (ADR 0065).
+    nonisolated var gitHub: any GitHubHostCLI { get }
+
+    /// New Terminal's home directory and Browse Directory, on this same SSH
+    /// connection, and nothing else of it.
+    nonisolated var browsing: any RexHostBrowsing { get }
+
     /// Closes the control link with a close frame, so the server forgets this
     /// client at once, then the SSH connection and every channel on it.
     func close() async
@@ -140,7 +148,10 @@ protocol RexHostExtensionPlacing: Sendable {
 
 /// What a Rex Host uses of its SSH connection. `HeelerSSHTransport` is the
 /// production one; tests script one.
-protocol RexHostConnection: ServerKindDetectionConnection, RexHostReads, RexHostStaging, RexHostExtensionPlacing {
+protocol RexHostConnection:
+    ServerKindDetectionConnection, RexHostReads, RexHostStaging, RexHostExtensionPlacing, GitHubHostCLI,
+    RexHostBrowsing
+{
     nonisolated var routeID: UUID? { get }
 
     var isConnected: Bool { get async }
@@ -152,6 +163,14 @@ protocol RexHostConnection: ServerKindDetectionConnection, RexHostReads, RexHost
     /// A channel to the socket under an attach slot, for a data link. SSH
     /// refusing it throws `.streamLocalOpenFailed`.
     func openRexDataChannel(socketPath: String) async throws -> any HeelerSSHAPIChannel
+
+    /// A channel to a native Windows server for the control link: an exec of
+    /// `command` (`RexWindowsDial`) under the events slot, past whatever the
+    /// account's shell printed before it.
+    func openRexControlExec(command: String) async throws -> any HeelerSSHAPIChannel
+
+    /// The same exec under an attach slot, for a data link.
+    func openRexDataExec(command: String) async throws -> any HeelerSSHAPIChannel
 
     /// Runs a `RexSocketCheck` script in one bounded exec.
     func runRexSocketCheck(_ script: Data) async throws -> GitExecResult
@@ -165,8 +184,10 @@ extension RexHostConnection {
     }
 }
 
-/// A Rex Host over SSH: direct-streamlocal channels to the server's socket.
-/// It never runs `rex`, and connecting starts no server.
+/// A Rex Host over SSH: direct-streamlocal channels to the server's socket on
+/// macOS and Linux; on native Windows, execs of Rex's stdio bridge to its
+/// named pipe (`RexWindowsDial`), which start no server either. Connecting
+/// starts no server.
 actor RexSSHTransport: RexTransport {
     nonisolated let routeID: UUID?
     nonisolated let socket: RexSocket
@@ -259,6 +280,9 @@ actor RexSSHTransport: RexTransport {
     }
 
     func openDataChannel() async throws -> any HeelerSSHAPIChannel {
+        if let command = RexWindowsDial.command(for: socket) {
+            return try await connection.openRexDataExec(command: command)
+        }
         do {
             return try await connection.openRexDataChannel(socketPath: socket.path)
         } catch TransportError.streamLocalOpenFailed {
@@ -277,6 +301,12 @@ actor RexSSHTransport: RexTransport {
     nonisolated var extensionPlacing: any RexHostExtensionPlacing {
         RexExtensionPlacingOnly(connection: connection)
     }
+
+    /// And its gh runs, for the same reason.
+    nonisolated var gitHub: any GitHubHostCLI { RexGitHubOnly(connection: connection) }
+
+    /// And its home directory and directory listings, for the same reason.
+    nonisolated var browsing: any RexHostBrowsing { RexBrowsingOnly(connection: connection) }
 
     func close() async {
         await control.close()
@@ -315,10 +345,13 @@ actor RexSSHTransport: RexTransport {
             throw TransportError.rexNotInstalled
         case .notRunning:
             throw TransportError.rexServerNotRunning(socketPath: nil)
+        case .notUsable(let path) where RexSocket.isWindowsPipeAddress(path):
+            throw TransportError.rexLookupFailed(reason: RexWindowsDial.notOnPathReason)
         case .notUsable(let path):
             throw TransportError.rexAccountRefused(socketPath: path)
         case .unsupported:
-            throw TransportError.rexLookupFailed(reason: String(localized: "Heeler finds Rex on macOS and Linux Hosts only."))
+            throw TransportError.rexLookupFailed(
+                reason: String(localized: "Heeler finds Rex on macOS, Linux and Windows Hosts only."))
         case .unreadable:
             throw TransportError.rexLookupFailed(
                 reason: String(localized: "Heeler could not read whether Rex is on this Host."))
@@ -329,6 +362,21 @@ actor RexSSHTransport: RexTransport {
         over connection: any RexHostConnection, socket: RexSocket, resuming previous: RexControlLink?,
         options: RexControlLink.Options, sleep: @escaping RexControlLink.Sleep, nonce: @Sendable () -> String
     ) async throws -> RexControlLink {
+        if let command = RexWindowsDial.command(for: socket) {
+            let channel = try await connection.openRexControlExec(command: command)
+            do {
+                return try await RexControlLink.open(
+                    over: channel, resuming: previous, options: options, sleep: sleep)
+            } catch let error as RexControlError {
+                // The bridge exits before the upgrade when no server listens
+                // or `rex` is not on the exec's PATH: say which, as a look can.
+                switch error {
+                case .upgradeFailed, .linkEnded:
+                    throw await windowsRefusal(of: socket, over: connection, nonce: nonce()) ?? error
+                default: throw error
+                }
+            }
+        }
         let channel: any HeelerSSHAPIChannel
         do {
             channel = try await connection.openRexControlChannel(socketPath: socket.path)
@@ -336,6 +384,18 @@ actor RexSSHTransport: RexTransport {
             throw await refusal(of: socket, over: connection, nonce: nonce())
         }
         return try await RexControlLink.open(over: channel, resuming: previous, options: options, sleep: sleep)
+    }
+
+    /// Why a native Windows server did not answer, when a fresh look can say.
+    private static func windowsRefusal(
+        of socket: RexSocket, over connection: any RexHostConnection, nonce: String
+    ) async -> TransportError? {
+        switch try? await RexProbe.run(over: connection, nonce: nonce) {
+        case .notInstalled: .rexNotInstalled
+        case .notRunning: .rexServerNotRunning(socketPath: socket.path)
+        case .notUsable: .rexLookupFailed(reason: RexWindowsDial.notOnPathReason)
+        default: nil
+        }
     }
 
     /// Why SSH refused the socket, as far as the Host can say.
@@ -418,6 +478,37 @@ private struct RexExtensionPlacingOnly: RexHostExtensionPlacing {
 
     func placeHeelersExtension(_ contents: Data, inFolder folder: String) async throws {
         try await connection.placeHeelersExtension(contents, inFolder: folder)
+    }
+}
+
+/// A Rex Host connection's gh runs, and nothing else of it.
+private struct RexGitHubOnly: GitHubHostCLI {
+    let connection: any GitHubHostCLI
+
+    func runGitHubScript(_ script: Data, isMutation: Bool) async throws -> GitExecResult {
+        try await connection.runGitHubScript(script, isMutation: isMutation)
+    }
+}
+
+/// What New Terminal reads of a Rex Host besides the server (ADR 0049's
+/// update of 2026-11-25): the account's home directory, from the probe every
+/// Host's New Terminal makes, which names a native Windows account's
+/// `USERPROFILE` too, and the directories Browse Directory lists over SFTP.
+protocol RexHostBrowsing: Sendable {
+    func remoteHomeDirectory() async throws -> String
+    func listDirectories(at path: String) async throws -> RemoteDirectoryListing
+}
+
+/// A Rex Host connection's browsing, and nothing else of it.
+private struct RexBrowsingOnly: RexHostBrowsing {
+    let connection: any RexHostBrowsing
+
+    func remoteHomeDirectory() async throws -> String {
+        try await connection.remoteHomeDirectory()
+    }
+
+    func listDirectories(at path: String) async throws -> RemoteDirectoryListing {
+        try await connection.listDirectories(at: path)
     }
 }
 

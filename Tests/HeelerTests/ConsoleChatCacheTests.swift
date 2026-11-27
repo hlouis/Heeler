@@ -535,6 +535,32 @@ struct ConsoleChatCacheTests {
         }
     }
 
+    @Test func removingASavedChatDeletesTheHostFilesOnlyItOpened() async throws {
+        let host = Host(address: "offline.invalid", username: "reader")
+        let cache = VolatileChatTranscriptCache()
+        let removed = Self.agent(host: host, session: Self.sessionA)
+        let kept = Self.agent(host: host, session: Self.sessionB, terminalID: "t2", paneID: "w1:p2")
+        await cache.saveAgentDirectory([ChatCachedAgent(removed), ChatCachedAgent(kept)], for: host)
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "ConsoleHostFiles-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let files = HostFileCache(root: root)
+        let own = try #require(HostFileCache.Key(hostID: host.id, path: "/a.png", size: 4, modificationTime: 1))
+        let shared = try #require(HostFileCache.Key(hostID: host.id, path: "/b.png", size: 4, modificationTime: 1))
+        _ = try #require(await files.keep(Data("abcd".utf8), named: "a.png", for: own, openedBy: "t1"))
+        _ = try #require(await files.keep(Data("abcd".utf8), named: "b.png", for: shared, openedBy: "t1"))
+        _ = try #require(await files.file(for: shared, openedBy: "t2"))
+        let console = ConsoleStore(chatCache: cache, hostFileCache: files)
+        defer { console.setHosts([]) }
+        console.setHosts([host])
+        await console.cachedChats.settled()
+
+        #expect(console.removeSavedChat(removed))
+
+        try await Self.waitUntil { await files.diskUsage() == 4 }
+        #expect(await files.file(for: shared, openedBy: "t2") != nil)
+    }
+
     @Test func aSavedChatRemovedDuringRevalidationStaysRemoved() async {
         let host = Host(address: "host", username: "reader")
         let cache = VolatileChatTranscriptCache()
@@ -728,6 +754,31 @@ struct ConsoleChatCacheTests {
         return entry
     }
 
+    @Test func debouncesDirectoryWritesAndFlushesImmediatelyOnSettled() async throws {
+        let host = Host(address: "host", username: "reader")
+        let cache = CountingDirectoryCache()
+        let directory = ConsoleChatCache(cache: cache, writeDebounce: .seconds(5))
+        directory.setHosts([host])
+        await directory.settled()
+
+        var first = Self.agent(host: host, session: Self.sessionA)
+        first.agent = first.agent.applyingConversationTitle("Title 1")
+        var second = first
+        second.agent = second.agent.applyingConversationTitle("Title 2")
+        var third = first
+        third.agent = third.agent.applyingConversationTitle("Title 3")
+
+        directory.observe([first], on: host)
+        directory.observe([second], on: host)
+        directory.observe([third], on: host)
+
+        #expect(await cache.saveCount == 0)
+
+        await directory.settled()
+        #expect(await cache.saveCount == 1)
+        #expect(await cache.loadAgentDirectory(for: host).agents.first?.title == "Title 3")
+    }
+
     private static func waitUntil(_ condition: @MainActor () async -> Bool) async throws {
         for _ in 0..<400 {
             if await condition() { return }
@@ -757,6 +808,28 @@ struct ConsoleChatCacheTests {
         }
 
         func saveAgentDirectory(_ contents: ChatAgentDirectory.Contents, for host: Host) async {
+            await backing.saveAgentDirectory(contents, for: host)
+        }
+
+        func load(_ key: ChatCacheKey) async -> ChatCacheLoadResult { await backing.load(key) }
+        func save(_ document: ChatCacheDocument) async { await backing.save(document) }
+        func remove(_ key: ChatCacheKey) async { await backing.remove(key) }
+        func retainHosts(_ hostIDs: Set<UUID>) async { await backing.retainHosts(hostIDs) }
+        func removeAll() async { await backing.removeAll() }
+        func diskUsage() async -> Int64 { await backing.diskUsage() }
+        func prune() async { await backing.prune() }
+    }
+
+    private actor CountingDirectoryCache: ChatTranscriptCache {
+        private let backing = VolatileChatTranscriptCache()
+        private(set) var saveCount = 0
+
+        func loadAgentDirectory(for host: Host) async -> ChatAgentDirectory.Contents {
+            await backing.loadAgentDirectory(for: host)
+        }
+
+        func saveAgentDirectory(_ contents: ChatAgentDirectory.Contents, for host: Host) async {
+            saveCount += 1
             await backing.saveAgentDirectory(contents, for: host)
         }
 

@@ -17,9 +17,10 @@ actor FakeRexServer {
         /// Nil leaves `resumed` out, as Rex does for a new client.
         var resumed: Bool?
         var protocolName = RexControlProtocol.subprotocol
-        var apiRevision = 12
-        var serverRevision = 12
-        var minimumRevision = 12
+        /// Rex 0.1.0-preview.23 welcomes this build's hello at revision 19.
+        var apiRevision = 19
+        var serverRevision = 19
+        var minimumRevision = 0
         var maxMessageBytes: Int? = 1_048_576
 
         init() {}
@@ -141,6 +142,15 @@ actor FakeRexServer {
     func nextRequest() async -> Request {
         while unanswered.isEmpty { await waitForChange() }
         return unanswered.removeFirst()
+    }
+
+    /// Every request for `method` no scripted answer took so far, without
+    /// waiting for one. Taken after `answer` for that method, it is every
+    /// request left unanswered: none arrives unanswered between the two.
+    func takeUnanswered(_ method: String) -> [Request] {
+        let taken = unanswered.filter { $0.method == method }
+        unanswered.removeAll { $0.method == method }
+        return taken
     }
 
     /// `seq` defaults to the last event pushed, as Rex numbers a response.

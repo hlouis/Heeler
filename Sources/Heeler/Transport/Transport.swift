@@ -2,7 +2,7 @@ import Foundation
 
 /// The app-side abstraction that executes herdr API requests over SSH.
 /// UI code talks to Transport, never to SSH primitives (ADR 0011).
-protocol Transport: HostServices, HostNotificationFiles {
+protocol Transport: HostServices, HostNotificationFiles, AmpChatHost {
     /// The catalog route this connection reached (ADR 0022); nil where the
     /// transport does not know one.
     var routeID: UUID? { get }
@@ -467,6 +467,15 @@ struct AgentTemplate: Sendable, Hashable, Identifiable {
 /// How a Terminal's program ended for good. A nil `code`: no exit, as after a kill.
 struct ProgramExit: Sendable, Equatable {
     let code: Int?
+}
+
+/// A launch whose program ended before the launch finished: before Heeler
+/// finished setting up what it started (on tmux, the window closed with its
+/// program, and the session with it, before the session was marked), or
+/// before the program showed running. tmux keeps no exit code, so `exit` has
+/// none there.
+struct ProgramEndedAtLaunch: Error, Equatable {
+    let exit: ProgramExit
 }
 
 /// A Template launch on a herdr-core Host. Its name goes out as the core's

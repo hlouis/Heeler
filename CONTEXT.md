@@ -36,7 +36,9 @@ _Avoid_: backend, server type, flavor
 
 **Rex Host**:
 A Host's Rex Server that is on: one Rex server on macOS or Linux, found by the
-Unix socket it listens on and stored with that socket's path. A look lists it
+Unix socket it listens on and stored with that socket's path, or on native
+Windows, found by its named pipe and stored with the pipe's address, which
+each channel reaches through Rex's stdio bridge. A look lists it
 running where the socket is there, and not running where Rex is installed
 without one; turned on then, it connects once the user starts Rex, since
 Heeler never starts the server and never runs the `rex` command-line tool to
@@ -50,13 +52,19 @@ program reports nothing to Rex reads Unknown and has no Stop and no Blocked
 Card. Where Chat is
 offered, its Agents take images and files too, staged over the Host's SSH
 connection as on the other Server Kinds. A Rex Host offers no notifications,
-Live Activities, Usage, Changes or New Agent (ADR 0056).
+Live Activities, Usage, Changes or New Agent (ADR 0056). New Terminal starts
+a shell in a new window of a Workspace's session, left in the background, and
+New Workspace a new session holding one, the only things Heeler starts on a
+Rex server; it gives the new terminal's size back at once (ADR 0049's update
+of 2026-11-25).
 Every build offers it; the user guide and the changelog call it experimental
 (ADR 0049). One control connection follows the whole server: every session's
 terminals, kept current by Rex's events and read again after any new
 connection. Another server instance on the socket is another server, as
-with tmux (ADR 0050). A Rex Host's terminals open from the server's own
-redraw, and their size is asked for (ADR 0051). They take input from their
+with tmux, unless it restored the last one's sessions: one that sees the same
+files and lists one of them continues the server (ADR 0050). A Rex Host's
+terminals open from the server's own redraw, and their size is asked for
+(ADR 0051). They take input from their
 first paint, one request at a time on the control connection, never sent
 twice (ADR 0052). A terminal Heeler shows takes its size for this screen on
 its own, once per showing, and gives it back once the view stops showing it;
@@ -297,7 +305,8 @@ _Avoid_: project, folder, window, space (the desktop app's word)
 **Worktree**:
 A fresh git checkout of a workspace's repository, opened as its own workspace
 so a new Agent starts on a clean copy of the code. On Herdr TUI herdr creates
-it; the branch defaults to herdr's generated `worktree/<name>` off HEAD;
+it, opened as a new Workspace named after the branch; the branch defaults to
+herdr's generated `worktree/<name>` off HEAD;
 removing the Worktree deletes the checkout and closes its workspace, but the
 branch survives. Snapshot worktree metadata also describes the main checkout;
 only `is_linked_worktree` makes a workspace eligible for linked-Worktree
@@ -308,6 +317,10 @@ Terminals, and the branch survives. On tmux Heeler creates it the same way at
 `~/.heeler/worktrees/<repository>/<branch>`, opened as a new Workspace named
 after the branch, numbered when that name is taken; removing it first ends that
 Workspace's Panes, never those of a Workspace that only shares its name.
+A new branch starts from the Workspace's HEAD, except when New Agent opens from
+a pull request or an issue: then it starts from the pull request's head commit,
+or the repository's default branch, fetched first, and a pull request's own
+branch is made or moved forward to it.
 _Avoid_: sandbox, branch copy, checkout folder
 
 **Checkout**:
@@ -331,7 +344,9 @@ Changes belongs to the Checkout: it shows whatever the Host's account can
 read, never "the files this Agent made", and marks an item changed in the last
 ten minutes without saying who changed it. Viewing Files never changes the
 Host. A file opened in a viewer, shared or saved is first copied to this
-device, and the copy goes when its preview or Files closes (ADR 0059).
+device, and the copy is kept so the same version of the file opens again
+without a download, for up to 7 days since last opened, until every Agent
+that opened it is closed or its saved Chat removed (ADR 0059).
 _Avoid_: file manager, SFTP browser, downloads, Agent's files
 
 **Port Preview**:
@@ -355,7 +370,7 @@ when asked, never watched (ADR 0062).
 _Avoid_: port scan, forwarded ports, services
 
 **Console**:
-The native dashboard surface, split into Agents, Terminals, Hosts, and Settings tabs; the two lists share one Host filter, which an open Agent's switcher follows while keeping that Agent's own chip, and each hides its own search field until pulled down. Agents lists Agents across Hosts as a flat list or collapsible sections By Host or By Workspace, opening Agent detail. Both lists name a row's, a card's and a section's Host alone, never its Server; By Host has one section per Host, in the Hosts tab's order, holding all its Servers' items, and leaves out a Host with nothing to list, say or offer, as a connected Rex Host can be (ADR 0047). Workspace sections are scoped to their Server, under its Host's name, and ordered by their first Agent in the existing priority order; Agents keep their relative order within each section. A linked-worktree Workspace nests under the first main-checkout Workspace of the same repository on its Host (a collapsed parent counts its worktrees' Agents), and stays top-level when that Host has no such Workspace with Agents. Until a snapshot proves a Host's Agents, its saved Chat entries are placed by the Workspace structure its last snapshot reported, so its cards keep the shape they had. By Workspace draws each top-level Workspace as a card: a repository's card titles its main checkout by the branch its Agents' Changes reads found (until a read of the launch lands, the branch the last one found, saved with the Workspace structure) and each worktree by its Workspace, and rows leave the Workspace, Host, and checkout directory to the card. Presentation and collapse choices persist, and search opens matching sections without changing those choices. Terminals lists ordinary shell Panes as one card per Workspace, By Workspace or nested By Host, opening Shell Terminal. Hosts is Host management. The Console reopens the list tab it last showed. On an iPad beside its sidebar the tabs give way to the sidebar: a switch between the two lists at its top, Hosts and Settings as sheets from its foot, and each list's search behind a button there.
+The native dashboard surface, split into Agents, Terminals, GitHub, Usage, Hosts, and Settings tabs. GitHub and Usage each have a switch in Settings; with both on, Settings leaves the tab bar and opens from the Hosts tab (ADR 0065). The two lists share one Host filter, which an open Agent's switcher follows while keeping that Agent's own chip, and each hides its own search field until pulled down. Agents lists Agents across Hosts as a flat list or collapsible sections By Host or By Workspace, opening Agent detail. Both lists name a row's, a card's and a section's Host alone, never its Server; By Host has one section per Host, in the Hosts tab's order, holding all its Servers' items, and leaves out a Host with nothing to list, say or offer, as a connected Rex Host can be (ADR 0047). Workspace sections are scoped to their Server, under its Host's name, and ordered by their first Agent in the existing priority order; Agents keep their relative order within each section. A linked-worktree Workspace nests under the first main-checkout Workspace of the same repository on its Host (a collapsed parent counts its worktrees' Agents), and stays top-level when that Host has no such Workspace with Agents. Until a snapshot proves a Host's Agents, its saved Chat entries are placed by the Workspace structure its last snapshot reported, so its cards keep the shape they had. By Workspace draws each top-level Workspace as a card: a repository's card titles its main checkout by the branch its Agents' Changes reads found (until a read of the launch lands, the branch the last one found, saved with the Workspace structure) and each worktree by its Workspace, and rows leave the Workspace, Host, and checkout directory to the card. Presentation and collapse choices persist, and search opens matching sections without changing those choices. Terminals lists ordinary shell Panes as one card per Workspace, By Workspace or nested By Host, opening Shell Terminal. Hosts is Host management. The Console reopens the list tab it last showed. On an iPad beside its sidebar the tabs give way to the sidebar: a switch at its top between the two lists and the GitHub List and Usage when they are on, Hosts and Settings as sheets from its foot, and each list's search behind a button there.
 _Avoid_: dashboard, home
 
 **Agent Row Layout**:
@@ -499,9 +514,12 @@ _Avoid_: recent link, visible link, link history
 
 **Chat**:
 The native conversation a Claude Code, Codex, Pi, Oh My Pi, Grok Build,
-OpenCode or Antigravity CLI Agent's detail can show in its terminal's place,
-read from the Agent's Transcript. Chat holds no Attach; its Composer and draft are the
-terminal's. Send is one `agent.prompt` request, made only after a screen read
+OpenCode, Antigravity CLI or Amp Agent's detail can show in its terminal's place.
+Most programs read from the Agent's Transcript. On POSIX Herdr TUI Hosts,
+Amp Chat reads the thread selected in the foreground Amp terminal through
+Heeler's Amp plugin. Confirm its installation in Chat, then reload plugins in
+Amp. Plain text goes to that same thread through the plugin (ADR 0066). Chat holds no Attach; its Composer and draft are the
+terminal's. For transcript-backed Chat on Herdr TUI, Send is one `agent.prompt` request, made only after a screen read
 shows the program's input box empty, and refused for text the program would
 run rather than read. Its `/` menu offers the Agent's skills and `/compact`;
 for OpenCode, only `/compact`. Chat never resends: text left in the box after
@@ -520,8 +538,9 @@ answers keep the rules above, but type through an attach of Chat's own, open
 only for that action, that keeps the Terminal's size, with the Composer's checked
 steps, and read the
 screen from an observing attach's first paint (ADR 0035).
-On Rex, for Claude Code, Codex, Pi and Oh My Pi only, Chat binds the
-conversation as on herdr-core, from what the Host's SSH connection reads
+On Rex, for Claude Code, Codex, Pi and Oh My Pi only (on native Windows,
+Claude Code alone), Chat binds the conversation as on herdr-core, from what
+the Host's SSH connection reads
 about the foreground process Rex names, and keeps a choice on this device. A
 Pi or Oh My Pi there is bound from a file Heeler's extension keeps for its
 process, where a label holds it on herdr-core. Its Send, Stop and
@@ -605,6 +624,41 @@ estimated cost of those tokens at API list prices. It counts only what the
 Transcripts of the Host's Accounts still hold, and is never an Account's Usage
 Limits or a bill.
 _Avoid_: spend, cost (alone), usage (unqualified), credits
+
+**GitHub List**:
+The pull requests, or the issues, that GitHub finds for the account gh is
+signed in to on one Host, across repositories, as one list under a row of
+filters: State, Person, Repository and Label, kept for each of the two on the
+device. At their defaults it holds the open ones that involve the account:
+pull requests the user opened or whose review is asked of them, issues
+assigned to the user or opened by them. With a Repository chosen, Person
+defaults to Anyone: everyone's open items there. Heeler reads it by running gh over the
+Host's connection and never holds the account's token; on a Mac whose SSH
+session cannot read the login keychain, gh runs once in the desktop session
+instead. It is read for one Host at a time, a Host and not a Server, kept on
+the device for display only at the filters' defaults, and read again when
+shown stale, when a filter changes, when pulled, and on Check Again, never in
+the background (ADR 0065).
+_Avoid_: inbox, notifications, feed, dashboard
+
+**GitHub Detail**:
+One pull request or issue from the GitHub List, read again on its own when it
+opens and on a pull: its description, and a pull request's branches, checks,
+review, changes and comments, or an issue's labels, assignees and comments.
+Kept in memory only; its row replaces the list's copy. Its "⋯" offers
+Comment, Approve, Merge and Close, each one run of gh's own command on the
+Host, sent once, between a read of the item before, which can stop it, and
+one after, which says what came of it (ADR 0065).
+_Avoid_: item page, PR view
+
+**Send to Agent**:
+Putting a message about a GitHub Detail's pull request or issue in a running
+Agent's Composer: one sentence asking it to review, fix failing checks,
+address review comments, work on, investigate or just read the item, and the
+item's address. Agents of the item's Host in a checkout of its repository come
+first, marked On this branch or This repository from what git says there.
+Nothing is sent: the user sends the draft, as with Hand Off (ADR 0065).
+_Avoid_: assign, dispatch, delegate
 
 **Blocked Card**:
 Chat's native answer to the dialog on a Blocked Agent's screen, shown in the

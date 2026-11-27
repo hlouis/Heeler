@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import HeelerSSH
 import Testing
 
@@ -10,9 +11,11 @@ import Testing
 /// without its configuration.
 ///
 /// The session connects, attaches to every session, reads the inventory and
-/// each terminal's title and process, then leaves with a close frame. It
-/// creates nothing and changes nothing on the server: it only reads. It
-/// prints counts only, never labels, titles, programs or directories.
+/// each terminal's title and process, then leaves with a close frame. The
+/// inventory test only reads. The New Terminal test makes one session of its
+/// own, `heeler-lab-new-terminal`, and destroys it before it ends, touching
+/// no other. Both print counts only, never labels, titles, programs or
+/// directories.
 ///
 /// Give the socket path that `rex server status` prints on its endpoint line
 /// to the Simulator's launchd environment, run the suite, then unset it:
@@ -74,6 +77,72 @@ struct RexInventoryLiveTests {
         #expect(statuses.prefix(2) == [.connecting, .connected])
     }
 
+    /// New Terminal against the same server: a new session labeled
+    /// `heeler-lab-new-terminal` holding one shell in `/tmp`, then a second
+    /// shell in a new window of it, each listed by the inventory with no
+    /// owner left. The session is destroyed before the test ends, whatever
+    /// it found, so it leaves nothing behind; it touches no other session.
+    /// It prints counts only.
+    @Test func newTerminalStartsShellsTheInventoryLists() async throws {
+        let socketPath = try #require(
+            ProcessInfo.processInfo.environment["HEELER_REX_LIVE_SOCKET"].flatMap { $0.isEmpty ? nil : $0 },
+            "HEELER_REX_LIVE_SOCKET names no Rex socket")
+        let session = RexHostSession(storedSocket: RexSocket(path: socketPath)) { _, previous in
+            try await LocalRexTransport.connect(path: socketPath, resuming: previous)
+        }
+        let latest = Mutex<RexInventory?>(nil)
+        await session.resume()
+        let updates = Task {
+            for await update in session.updates {
+                if case .inventory(let next) = update { latest.withLock { $0 = next } }
+            }
+        }
+        let ready = ContinuousClock.now + .seconds(20)
+        while latest.withLock({ $0 }) == nil, ContinuousClock.now < ready {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+
+        let first = try await session.createTerminal(.session(label: "heeler-lab-new-terminal"), cwd: "/tmp")
+        let sessionID = first.address.sessionID
+        var made = [first]
+        var owners: [String?] = []
+        do {
+            made.append(try await session.createTerminal(.window(sessionID: sessionID), cwd: nil))
+            let listed = ContinuousClock.now + .seconds(15)
+            while ContinuousClock.now < listed {
+                let terminals = latest.withLock { $0 }?.sessions.first { $0.id == sessionID }?.terminals ?? []
+                if terminals.count == made.count, terminals.allSatisfy({ $0.details.directory != nil }) { break }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            for created in made {
+                let size = try await session.withConnection { connection in
+                    try await connection.control.call(
+                        RexInventoryWire.terminalMethod("size"),
+                        payload: JSONValue.object([
+                            "session_id": .string(sessionID), "block_id": .string(created.address.blockID),
+                        ])
+                    ).result(JSONValue.self)
+                }
+                owners.append(size["owner"]?.stringValue)
+            }
+        } catch {
+            Issue.record("New Terminal failed: \(error)")
+        }
+        let terminals = latest.withLock { $0 }?.sessions.first { $0.id == sessionID }?.terminals ?? []
+        _ = try? await session.withConnection { connection in
+            try await connection.control.call(
+                "session.destroy", payload: JSONValue.object(["session_id": .string(sessionID)]))
+        }
+        updates.cancel()
+        await session.end()
+
+        let owned = owners.compactMap { $0 }.count
+        print("Rex New Terminal: made \(made.count), listed \(terminals.count), owned \(owned)")
+        #expect(Set(terminals.map(\.blockID)) == Set(made.map(\.address.blockID)))
+        #expect(terminals.first { $0.blockID == first.address.blockID }?.details.directory == "/private/tmp")
+        #expect(owners.count == made.count && owners.allSatisfy { $0 == nil })
+    }
+
     private static func isFailure(_ status: EventsSessionStatus) -> Bool {
         if case .failed = status { true } else { false }
     }
@@ -131,6 +200,12 @@ actor LocalRexTransport: RexTransport {
     /// Nor a folder to place Heeler's extension in.
     nonisolated var extensionPlacing: any RexHostExtensionPlacing { NoHostExtensionPlacing() }
 
+    /// Nor a gh to run.
+    nonisolated var gitHub: any GitHubHostCLI { NoHostGitHub() }
+
+    /// Nor a home directory or directories to browse.
+    nonisolated var browsing: any RexHostBrowsing { NoHostBrowsing() }
+
     func close() async {
         closed = true
         await control.close()
@@ -150,6 +225,20 @@ private struct NoHostReads: RexHostReads {
         throw Self.unavailable
     }
 }
+
+/// The browsing of a transport with no SSH connection: each one fails.
+private struct NoHostBrowsing: RexHostBrowsing {
+    func remoteHomeDirectory() async throws -> String {
+        throw TransportError.hostFeatureUnavailable(feature: "Host reads")
+    }
+
+    func listDirectories(at _: String) async throws -> RemoteDirectoryListing {
+        throw TransportError.hostFeatureUnavailable(feature: "Host reads")
+    }
+}
+
+/// The gh runs of a transport with no SSH connection, which fail.
+private struct NoHostGitHub: GitHubHostCLI {}
 
 /// The placing of a transport with no SSH connection, which fails.
 private struct NoHostExtensionPlacing: RexHostExtensionPlacing {

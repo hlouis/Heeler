@@ -51,6 +51,23 @@ struct ConsoleView: View {
     @State private var isHostsTabSelected = false
     @State private var isSettingsTabSelected = false
     @State private var isUsageTabSelected = false
+    @State private var isGitHubTabSelected = false
+    @State private var isShowingGitHubListMenu = false
+    @State private var gitHubListMenuTitleFrame: CGRect?
+    /// Whether the Hosts tab has Settings on its stack, where Settings has
+    /// no tab of its own (`settingsUnderHosts`).
+    @State private var isSettingsShownUnderHosts = false
+    /// The Host whose Terminal the GitHub tab asked for, over the New
+    /// Terminal sheet's own choice.
+    @State private var gitHubTerminalHostID: Host.ID?
+    /// The pull request or issue the GitHub tab shows: in the detail column
+    /// beside an iPad's sidebar, pushed on the tab's stack without one.
+    /// One value for both, so resizing the window keeps what it shows.
+    @State private var gitHubSelection: GitHubItemLink?
+    @State private var gitHubSendRequest: GitHubSendRequest?
+    /// The GitHub tab's open write sheet, kept here, as Send to Agent's is,
+    /// so the sheet and its draft outlive the tab's layout changing.
+    @State private var gitHubWriteRequest: GitHubWriteSheetRequest?
     /// The Host the Usage tab reads; nil reads every Host.
     @State private var usageScopeHostID: Host.ID?
     @State private var usageMetric = AgentUsageMetric.cost
@@ -178,9 +195,10 @@ struct ConsoleView: View {
     @State private var tabBarRequest = ConsoleTabBarBridge.Request()
     /// The pop a collapsed split view said it is making; see `compactColumn(for:)`.
     @State private var compactPop = CompactPop()
-    /// Which pass of `body` built the rows and the detail now showing; see
-    /// `KeyedContent`.
-    @State private var contentPass = ContentPass()
+    /// Tracks builder environment stamps separately for rows and detail so
+    /// local `@State` ticks (such as folding one Workspace card or measuring
+    /// a bar) never invalidate unrelated `KeyedContent` rows.
+    @State private var passTracker = ConsolePassTracker()
     @Environment(\.openWindow) private var openWindow
     @Environment(\.supportsMultipleWindows) private var supportsMultipleWindows
     /// The window-aware entry into navigation; nil outside a scene root.
@@ -189,9 +207,42 @@ struct ConsoleView: View {
     /// (ADR 0048); nil in previews and tests.
     @Environment(HostUpdatesStore.self) private var hostUpdates: HostUpdatesStore?
 
+    private var rowBuilderPass: Int {
+        passTracker.rowPass(
+            for: ConsoleRowBuilderStamp(
+                console: ObjectIdentifier(console),
+                hosts: ObjectIdentifier(hosts),
+                horizontalSizeClass: horizontalSizeClass,
+                colorScheme: colorScheme,
+                reduceMotion: reduceMotion,
+                dynamicTypeSize: dynamicTypeSize,
+                supportsMultipleWindows: supportsMultipleWindows,
+                hasSceneRouting: sceneRouting != nil))
+    }
+
+    private var detailBuilderPass: Int {
+        passTracker.detailPass(
+            for: ConsoleDetailBuilderStamp(
+                console: ObjectIdentifier(console),
+                hosts: ObjectIdentifier(hosts),
+                terminalThemes: ObjectIdentifier(terminal.themes),
+                inputMode: ObjectIdentifier(inputMode),
+                detailSurface: ObjectIdentifier(detailSurface),
+                activity: ObjectIdentifier(activity),
+                currentTab: currentTab,
+                horizontalSizeClass: horizontalSizeClass,
+                colorScheme: colorScheme,
+                themeAppearance: themeAppearance,
+                reduceMotion: reduceMotion,
+                dynamicTypeSize: dynamicTypeSize,
+                scenePhase: scenePhase,
+                supportsMultipleWindows: supportsMultipleWindows,
+                hasSceneRouting: sceneRouting != nil,
+                shellRoute: agentShellRoute))
+    }
+
     var body: some View {
         let _ = PerfTrace.count("ConsoleView.body")
-        let _ = contentPass.advance()
         tabs.modifier(ConsoleDetailCoresRetention(cores: detailCores, held: heldDetails))
             .modifier(
                 HostUpdatesPrompt(
@@ -234,11 +285,17 @@ struct ConsoleView: View {
                 Label(ConsoleTab.terminals.title, systemImage: "terminal")
                     .environment(\.symbolVariants, .none)
             }
-            if console.isUsageEnabled {
-                Tab(ConsoleTab.usage.title, systemImage: "chart.bar.xaxis", value: ConsoleTab.usage) {
-                    MainActorContent { usageTab() }
-                }
+            // Hidden rather than left out: one switch can add a tab and take
+            // Settings away at once, and with the set of tabs changing the
+            // bar gave the new tab another tab's icon.
+            Tab(ConsoleTab.github.title, systemImage: ConsoleTab.gitHubSymbol, value: ConsoleTab.github) {
+                MainActorContent { gitHubTab() }
             }
+            .hidden(!console.isGitHubEnabled)
+            Tab(ConsoleTab.usage.title, systemImage: "chart.bar.xaxis", value: ConsoleTab.usage) {
+                MainActorContent { usageTab() }
+            }
+            .hidden(!console.isUsageEnabled)
             Tab(ConsoleTab.hosts.title, systemImage: "server.rack", value: ConsoleTab.hosts) {
                 // In a body of its own: the Hosts list reads every Host's
                 // status and latency, which change while another tab shows.
@@ -255,11 +312,12 @@ struct ConsoleView: View {
                 MainActorContent { settingsView() }
                     .id(settingsTabGeneration)
             } label: {
-                // Outlined, as Terminals is: filled, the gear is the heaviest
-                // icon in the bar.
+                // Outlined, as Terminals is: filled, the gear is the
+                // heaviest icon in the bar.
                 Label(ConsoleTab.settings.title, systemImage: "gearshape")
                     .environment(\.symbolVariants, .none)
             }
+            .hidden(settingsUnderHosts)
         }
         // `lastListTab` is every window's; this window keeps the list tab it
         // opened on even when another window picks a different one.
@@ -293,6 +351,19 @@ struct ConsoleView: View {
                 // The Agent that got the Hand Off opens, with it in its Composer.
                 selectAgent(id)
             })
+        .modifier(
+            GitHubSendSheetPresenter(
+                request: $gitHubSendRequest, console: console,
+                hosts: hosts.consoleHosts.offeringNewItem(
+                    listsTerminals: false, capabilities: { console.capabilities(for: $0) })
+            ) { id in
+                // The Agent opens with the message in its Composer.
+                selectAgent(id)
+            })
+        .modifier(
+            GitHubWriteSheetPresenter(
+                request: $gitHubWriteRequest, store: console.gitHub,
+                mayShowResult: { currentTab == .github && !isConsoleSheetUp }))
         .sheet(item: $startAgentRequest) { request in
             ConsoleSheetContent(sheetPresentation) { presentation in
                 // StartAgentView brings its own NavigationStack.
@@ -329,20 +400,22 @@ struct ConsoleView: View {
             connectionDetailRequest: $connectionDetailRequest,
             savedChatRemovalMessage: savedChatRemovalMessage(for:),
             removeSavedChat: removeSavedChat,
-            leaveUsage: leaveUsage))
+            leaveUsage: leaveUsage,
+            leaveGitHub: leaveGitHub,
+            moveSettings: moveSettings(underHosts:)))
         .alert("Could Not Close", isPresented: tabCloseErrorPresented) {
             Button("OK", role: .cancel) { tabCloseError = nil }
         } message: {
             Text(tabCloseError ?? "")
         }
-        .sheet(isPresented: $isStartingTerminal) {
+        .sheet(isPresented: $isStartingTerminal, onDismiss: { gitHubTerminalHostID = nil }) {
             ConsoleSheetContent(sheetPresentation) { presentation in
                 // NewTerminalView brings its own NavigationStack.
                 NewTerminalView(
                     hosts: hosts.consoleHosts.offeringNewItem(
                         listsTerminals: true, capabilities: { console.capabilities(for: $0) }),
                     console: console,
-                    initialHostID: newTerminalHostID
+                    initialHostID: gitHubTerminalHostID ?? newTerminalHostID
                 ) {
                     // A new shell lands in its terminal, as tapping its row would.
                     selectTerminal($0)
@@ -435,7 +508,15 @@ struct ConsoleView: View {
         // into their sheet, over the list tab beneath them.
         .onChange(of: usesSidebarNavigation) { _, usesSidebar in
             guard usesSidebar else { return }
-            if isHostsTabSelected {
+            if isHostsTabSelected, isSettingsShownUnderHosts {
+                // Settings under Hosts was the screen on show. The rebuilt
+                // Hosts tab opens on its list, and says so only once shown.
+                hostsTabRequest = nil
+                hostsTabGeneration += 1
+                isSettingsShownUnderHosts = false
+                isShowingSettingsSheet = true
+                isHostsTabSelected = false
+            } else if isHostsTabSelected {
                 hostsTabRequest = hostsTabRequest.map {
                     HostsTabRequest(hostID: $0.hostID, showsSetupGuide: $0.showsSetupGuide, origin: nil)
                 }
@@ -466,13 +547,29 @@ struct ConsoleView: View {
         Binding(
             get: {
                 if isHostsTabSelected { return .hosts }
-                if isSettingsTabSelected { return .settings }
-                if isUsageTabSelected { return .usage }
+                // Settings moved under Hosts a moment ago, before
+                // `moveSettings` caught up.
+                if isSettingsTabSelected { return settingsUnderHosts ? .hosts : .settings }
+                // Turned off a moment ago, before `leaveUsage` or
+                // `leaveGitHub` caught up: the tab is already hidden, and
+                // selecting a hidden tab stops the app.
+                if isUsageTabSelected, console.isUsageEnabled { return .usage }
+                if isGitHubTabSelected, console.isGitHubEnabled { return .github }
                 return shownListTab
             },
             set: { requested in
-                // Usage turned off behind a screen that opened from it.
-                let tab = requested == .usage && !console.isUsageEnabled ? shownListTab : requested
+                // Usage or GitHub turned off behind a screen that opened from it.
+                var tab = requested
+                if tab == .usage && !console.isUsageEnabled || tab == .github && !console.isGitHubEnabled {
+                    tab = shownListTab
+                }
+                // Where Settings has no tab, it opens on the Hosts tab's stack.
+                if tab == .settings, settingsUnderHosts, !usesSidebarNavigation {
+                    if !isSettingsShownUnderHosts {
+                        hostsTabRequest = HostsTabRequest(showsSettings: true, origin: nil)
+                    }
+                    tab = .hosts
+                }
                 let leavingList = shownListTab
                 // A search field keeping first responder through the switch
                 // can leave the arriving tab blank; its query stays.
@@ -480,6 +577,7 @@ struct ConsoleView: View {
                 isHostsTabSelected = tab == .hosts
                 isSettingsTabSelected = tab == .settings
                 isUsageTabSelected = tab == .usage
+                isGitHubTabSelected = tab == .github
                 guard tab.isList else { return }
                 if tab != leavingList, horizontalSizeClass == .regular {
                     swapListSelection(from: leavingList, to: tab)
@@ -536,13 +634,44 @@ struct ConsoleView: View {
             reconnectHost: { await reconnectMachine($0) },
             stopConnecting: { await console.cancelHostConnection($0) },
             origin: origin,
+            settings: onDone == nil && settingsUnderHosts && !usesSidebarNavigation
+                ? HostListSettingsLink(
+                    page: { AnyView(settingsView(isPushed: true)) },
+                    isShownInitially: hostsTabRequest?.showsSettings ?? false,
+                    onShownChange: { isSettingsShownUnderHosts = $0 })
+                : nil,
             onDone: onDone)
         .id(hostsTabRequest?.id)
     }
 
-    /// Settings, as a tab or a sheet. SettingsView brings its own
-    /// NavigationStack.
-    private func settingsView(onDone: (@MainActor () -> Void)? = nil) -> some View {
+    /// With both GitHub and Usage on, Settings leaves the tab bar and opens
+    /// from a gear on the Hosts tab (ADR 0065).
+    private var settingsUnderHosts: Bool { console.isUsageEnabled && console.isGitHubEnabled }
+
+    /// Settings moved between its tab and the Hosts tab. Whoever stands on
+    /// Settings stays on it: it opens where it went.
+    private func moveSettings(underHosts: Bool) {
+        guard !usesSidebarNavigation else { return }
+        if underHosts {
+            guard isSettingsTabSelected else { return }
+            hostsTabRequest = HostsTabRequest(showsSettings: true, origin: nil)
+            isSettingsTabSelected = false
+            isHostsTabSelected = true
+        } else if isSettingsShownUnderHosts {
+            // The Hosts tab opens on its list again.
+            hostsTabRequest = nil
+            hostsTabGeneration += 1
+            isSettingsShownUnderHosts = false
+            if isHostsTabSelected {
+                isHostsTabSelected = false
+                isSettingsTabSelected = true
+            }
+        }
+    }
+
+    /// Settings, as a tab, a sheet, or a page the Hosts tab pushes.
+    /// SettingsView brings its own NavigationStack except where pushed.
+    private func settingsView(onDone: (@MainActor () -> Void)? = nil, isPushed: Bool = false) -> some View {
         SettingsView(
             terminal: terminal,
             appearance: appearance,
@@ -556,7 +685,8 @@ struct ConsoleView: View {
             hasOnlyRexServersOn: hosts.hasOnlyRexServersOn,
             onHostAdded: { openHostFromSettings($0) },
             openHostHelper: { openHostFromSettings($0, opensHostHelper: true) },
-            onDone: onDone)
+            onDone: onDone,
+            isPushed: isPushed)
     }
 
     /// A Host page Settings asks for, once a Settings sheet is out of the way.
@@ -571,7 +701,123 @@ struct ConsoleView: View {
 
     /// The lists an iPad sidebar's title menu switches between.
     private var shownSidebarLists: [ConsoleTab] {
-        console.isUsageEnabled ? [.agents, .terminals, .usage] : [.agents, .terminals]
+        var lists: [ConsoleTab] = [.agents, .terminals]
+        if console.isGitHubEnabled { lists.append(.github) }
+        if console.isUsageEnabled { lists.append(.usage) }
+        return lists
+    }
+
+    /// GitHub, as a tab; beside an iPad's sidebar, its own split view whose
+    /// sidebar is the list, where the Agents list goes, and whose title
+    /// switches back to the other lists.
+    @ViewBuilder
+    private func gitHubTab() -> some View {
+        if usesSidebarNavigation {
+            let shown = gitHubShownSelection
+            NavigationSplitView {
+                GitHubListScreen(store: console.gitHub, terminals: gitHubTerminals, selection: gitHubSelectionID)
+                    // The column reports a compact size class beside a
+                    // detail, so the list is told it is the sidebar.
+                    .environment(\.isSidebarColumn, true)
+                    .modifier(SidebarListChrome(
+                        shown: .github, lists: shownSidebarLists,
+                        isPresented: $isShowingGitHubListMenu, titleFrame: $gitHubListMenuTitleFrame,
+                        select: { selectedTab.wrappedValue = $0 }, footer: tabSidebarFooter))
+            } detail: {
+                NavigationStack {
+                    if let shown {
+                        GitHubItemScreen(
+                            store: console.gitHub, host: shown.host, item: shown.item, send: gitHubSend,
+                            write: gitHubWrite
+                        )
+                        .id(shown.item.id)
+                    } else {
+                        ContentUnavailableView {
+                            Label(ConsoleTab.github.title, systemImage: ConsoleTab.gitHubSymbol)
+                        } description: {
+                            Text("The pull requests and issues that involve you, as gh reads them on your Hosts.")
+                        }
+                    }
+                }
+                .readableColumn()
+            }
+            .background {
+                ConsoleTabBarBridge(chromeScheme: nil, hidesBar: true, request: tabBarRequest)
+            }
+            .toolbarVisibility(.hidden, for: .tabBar)
+        } else {
+            GitHubTabView(
+                store: console.gitHub, path: gitHubPath, terminals: gitHubTerminals, send: gitHubSend,
+                write: gitHubWrite)
+                // A pushed detail hides the bar as an Agent's does.
+                .background {
+                    ConsoleTabBarBridge(chromeScheme: nil, hidesBar: hidesTabBar, request: tabBarRequest)
+                }
+                .toolbarVisibility(hidesTabBar ? .hidden : .automatic, for: .tabBar)
+        }
+    }
+
+    /// The selected item, while its Host is the one the GitHub tab shows.
+    private var gitHubShownSelection: GitHubItemLink? {
+        gitHubSelection.flatMap { $0.host.id == console.gitHub.selectedHost?.id ? $0 : nil }
+    }
+
+    /// The GitHub tab's stack without a sidebar: the selection, pushed.
+    private var gitHubPath: Binding<[GitHubItemLink]> {
+        Binding(
+            get: { gitHubShownSelection.map { [$0] } ?? [] },
+            set: { gitHubSelection = $0.last })
+    }
+
+    /// The sidebar row of the item in the detail column, on the Host shown.
+    /// The column keeps the item as it was picked, so a read that drops it
+    /// from the list leaves it on screen.
+    private var gitHubSelectionID: Binding<GitHubItem.ID?> {
+        Binding(
+            get: { gitHubShownSelection?.item.id },
+            set: { id in
+                guard let id else {
+                    gitHubSelection = nil
+                    return
+                }
+                guard let host = console.gitHub.selectedHost, let item = console.gitHub.listItem(id, on: host) else {
+                    return
+                }
+                gitHubSelection = GitHubItemLink(host: host, item: item)
+            })
+    }
+
+    /// Send to Agent, from a pull request's or an issue's detail.
+    private var gitHubSend: GitHubSendLink {
+        GitHubSendLink { gitHubSendRequest = $0 }
+    }
+
+    /// Comment, Approve or Merge, from a pull request's or an issue's detail.
+    private var gitHubWrite: GitHubWriteLink {
+        GitHubWriteLink { gitHubWriteRequest = $0 }
+    }
+
+    /// The GitHub tab's way to a Terminal on a Host: the New Terminal sheet,
+    /// on the Host's first Server that can start one.
+    private var gitHubTerminals: GitHubTerminalLink {
+        let offered = hosts.consoleHosts.offeringNewItem(
+            listsTerminals: true, capabilities: { console.capabilities(for: $0) })
+        return GitHubTerminalLink(
+            record: { host in offered.first { host.records.contains($0.id) }?.id },
+            open: { id in
+                gitHubTerminalHostID = id
+                isStartingTerminal = true
+            })
+    }
+
+    /// GitHub turned off, from this window or another: nothing of it stays
+    /// selected.
+    private func leaveGitHub() {
+        if isGitHubTabSelected { selectedTab.wrappedValue = shownListTab }
+        isShowingGitHubListMenu = false
+        gitHubSelection = nil
+        gitHubSendRequest = nil
+        gitHubWriteRequest = nil
     }
 
     /// Every Host the Usage tab can read, in catalog order, each once.
@@ -604,36 +850,10 @@ struct ConsoleView: View {
         if usesSidebarNavigation {
             NavigationSplitView {
                 AgentUsageSidebar(entries: usageEntries, scopeHostID: usageScope, metric: usageMetric)
-                    .navigationTitle(ConsoleTab.usage.title)
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            SidebarListMenu(
-                                shown: .usage, lists: shownSidebarLists,
-                                isPresented: $isShowingUsageListMenu, frame: $usageListMenuTitleFrame)
-                        }
-                        .toolbarItemBackground(.hidden)
-                    }
-                    .toolbar(removing: .title)
-                    .toolbar(removing: .sidebarToggle)
-                    .bottomBar { usageSidebarFooter }
-                    .overlay {
-                        GeometryReader { proxy in
-                            let anchor = SidebarListMenu.anchor(
-                                under: usageListMenuTitleFrame, in: proxy.frame(in: .global))
-                            Color.clear
-                                .frame(width: 1, height: 1)
-                                .popover(isPresented: $isShowingUsageListMenu, arrowEdge: .top) {
-                                    SidebarListChoices(
-                                        shown: .usage, lists: shownSidebarLists,
-                                        isPresented: $isShowingUsageListMenu,
-                                        select: { selectedTab.wrappedValue = $0 })
-                                }
-                                .position(anchor)
-                        }
-                        .ignoresSafeArea(.container, edges: .top)
-                        .allowsHitTesting(false)
-                    }
+                    .modifier(SidebarListChrome(
+                        shown: .usage, lists: shownSidebarLists,
+                        isPresented: $isShowingUsageListMenu, titleFrame: $usageListMenuTitleFrame,
+                        select: { selectedTab.wrappedValue = $0 }, footer: tabSidebarFooter))
             } detail: {
                 NavigationStack {
                     AgentUsageDashboard(
@@ -657,8 +877,9 @@ struct ConsoleView: View {
         }
     }
 
-    /// The Usage sidebar's foot: Hosts and Settings, as the lists' foot has.
-    private var usageSidebarFooter: some View {
+    /// The Usage or GitHub sidebar's foot: Hosts and Settings, as the lists'
+    /// foot has.
+    private var tabSidebarFooter: some View {
         HStack(spacing: 4) {
             Button(ConsoleTab.hosts.title, systemImage: "server.rack") { showHosts() }
                 .overlay(alignment: .topTrailing) { SidebarIconBadge(label: hostUpdatesBadge) }
@@ -757,7 +978,10 @@ struct ConsoleView: View {
             || connectionDetailRequest != nil || isShowingHostIssues
             || isShowingHostsSheet || isShowingSettingsSheet
         if isPresentingOverConsole, !ownsPresentation {
-            if isHostsTabSelected { hostsTabGeneration += 1 }
+            if isHostsTabSelected {
+                hostsTabGeneration += 1
+                isSettingsShownUnderHosts = false
+            }
             if isSettingsTabSelected { settingsTabGeneration += 1 }
         }
         showAgentsList(parking: parked)
@@ -767,6 +991,7 @@ struct ConsoleView: View {
         isHostsTabSelected = false
         isSettingsTabSelected = false
         isUsageTabSelected = false
+        isGitHubTabSelected = false
         startAgentRequest = nil
         isStartingTerminal = false
         connectionDetailRequest = nil
@@ -862,10 +1087,12 @@ struct ConsoleView: View {
 
     /// A pushed detail owns the whole iPhone screen, as it did before the
     /// tab bar existed. A wide iPhone keeps the bar to switch lists; an
-    /// iPad's sidebar switches them itself.
+    /// iPad's sidebar switches them itself. The GitHub tab's detail covers
+    /// its list in every width, so it hides the bar in every width.
     private var hidesTabBar: Bool {
-        usesSidebarNavigation
-            || (horizontalSizeClass == .compact && selectedItem.wrappedValue != nil)
+        if usesSidebarNavigation { return true }
+        if currentTab == .github { return gitHubShownSelection != nil }
+        return horizontalSizeClass == .compact && selectedItem.wrappedValue != nil
     }
 
     /// Beside an opaque sidebar, the detail's leading safe area lies under
@@ -1168,7 +1395,7 @@ struct ConsoleView: View {
                     focus: $focusedSearch, tab: .terminals,
                     prompt: "Search Terminals", showsField: !usesSidebarNavigation))
             }
-        case .usage, .hosts, .settings:
+        case .github, .usage, .hosts, .settings:
             // These tabs show their own screens, not a split view.
             EmptyView()
         }
@@ -1679,7 +1906,7 @@ struct ConsoleView: View {
                 // initializer makes its stores.
                 KeyedContent(
                     key: ConsoleAgentDetailKey(
-                        pass: contentPass.number, tab: tab, agent: agent, hosts: consoleHosts,
+                        pass: detailBuilderPass, tab: tab, agent: agent, hosts: consoleHosts,
                         repeatLandings: repeatLandings, session: ObjectIdentifier(session),
                         opening: detailOpening)
                 ) {
@@ -1908,6 +2135,11 @@ struct ConsoleView: View {
             }
             .modifier(ConsoleAgentListStyle(showsCards: mode == .byWorkspace))
             .modifier(ConsoleSidebarListTint())
+            .modifier(
+                ConsoleAgentListScrollFreeze(
+                    presentation: listPresentation,
+                    rowChanges: console.rowChanges,
+                    mode: mode))
             .searchDrawerStartsTucked()
         }
     }
@@ -1986,11 +2218,16 @@ struct ConsoleView: View {
             let renamesTitle =
                 capabilities.renameAgent
                 && ChatProgram(rawValue: agent.agent.kind).map(AgentTitleNaming.supportsRename) == true
+            let savedEntry = saved[agent.id]
+            let presentation = AgentCardPresentation(
+                agent: agent, layout: layout, hiding: [], leadsWithMark: true)
+            let display = makeAgentRowDisplay(agent, presentation: presentation)
             return ConsoleAgentRowKey(
                 pass: pass,
                 agent: agent,
+                display: display,
                 qualifier: qualifiers[agent.id],
-                saved: saved[agent.id],
+                saved: savedEntry,
                 layout: layout,
                 isPinned: console.pins.isPinned(hostID: agent.hostID, paneID: agent.agent.paneID),
                 isSelected: selection == .agent(agent.id),
@@ -2000,10 +2237,30 @@ struct ConsoleView: View {
         }
     }
 
+    private func makeAgentRowDisplay(
+        _ agent: ConsoleAgent, presentation: AgentCardPresentation
+    ) -> ConsoleAgentRowDisplay {
+        ConsoleAgentRowDisplay(
+            id: agent.id,
+            terminalID: agent.agent.terminalID,
+            kind: agent.agent.kind,
+            displayName: agent.agent.displayName,
+            status: agent.agent.status,
+            hostName: agent.hostName,
+            workspaceID: agent.agent.workspaceID,
+            workspaceLabel: agent.workspaceLabel,
+            directory: agent.directory,
+            cwd: agent.agent.cwd,
+            checkout: agent.repositoryCheckout,
+            presentation: presentation,
+            offersHandOff: console.offersHandOff(for: agent),
+            closeActionTitle: closeScope(for: agent).actionTitle)
+    }
+
     @ViewBuilder
     private func flatAgentListRows(filtered: [ConsoleAgent]) -> some View {
         let keys = makeAgentRowKeys(
-            for: filtered, pass: contentPass.number,
+            for: filtered, pass: rowBuilderPass,
             qualifiers: agentTitleQualifiers, saved: console.savedChatEntries)
         ForEach(keys, id: \.agent.id) { @Sendable key in
             KeyedContent(key: key) {
@@ -2016,7 +2273,7 @@ struct ConsoleView: View {
     private var workspaceAgentListRows: some View {
         let qualifiers = agentTitleQualifiers
         let saved = console.savedChatEntries
-        let pass = contentPass.number
+        let pass = rowBuilderPass
         let selectedAgentID = notificationRouter.path.last
         ForEach(workspaceCards) { @Sendable card in
             MainActorContent {
@@ -2040,47 +2297,167 @@ struct ConsoleView: View {
     ) -> [ConsoleWorkspaceRowKey] {
         var layouts: [Host.ID: AgentRowLayout] = [:]
         var capabilitiesByHost: [Host.ID: HostCapabilities] = [:]
-        return card.rows.map { placed in
-            guard case .agent(let agent, _, _) = placed.row else {
-                return ConsoleWorkspaceRowKey(pass: pass, placed: placed, card: card)
+        let summariesForCollapsed: [ConsoleCheckoutSummary]? =
+            card.isRepository && card.isCollapsed ? checkoutSummaries(card) : nil
+        let summarySlicesForCollapsed: [ConsoleWorkspaceRowKey.CheckoutSummarySlice] =
+            (summariesForCollapsed ?? []).map { summary in
+                .init(
+                    id: summary.id,
+                    title: summary.title,
+                    checkout: summary.checkout,
+                    statuses: summary.agents.map(\.agent.status),
+                    accessibilityText: summary.accessibilityText)
             }
-            let layout = layouts[agent.hostID] ?? {
-                let resolved = console.rowLayout(for: agent.hostID)
-                layouts[agent.hostID] = resolved
-                return resolved
-            }()
-            let capabilities = capabilitiesByHost[agent.hostID] ?? {
-                let resolved = console.capabilities(for: agent.hostID)
-                capabilitiesByHost[agent.hostID] = resolved
-                return resolved
-            }()
-            let savedEntry = saved[agent.id]
-            let origin = savedEntry == nil && capabilities.startsAgents
-                ? StartAgentStore.LaunchOrigin(beside: agent, in: console) : nil
-            let renamesTitle =
-                capabilities.renameAgent
-                && ChatProgram(rawValue: agent.agent.kind).map(AgentTitleNaming.supportsRename) == true
-            return ConsoleWorkspaceRowKey(
-                pass: pass,
-                placed: placed,
-                card: card,
-                qualifier: qualifiers[agent.id],
-                saved: savedEntry,
-                layout: layout,
-                isPinned: console.pins.isPinned(hostID: agent.hostID, paneID: agent.agent.paneID),
-                isSelected: selectedAgentID == agent.id,
-                isShownInWindow: selectedAgentID == agent.id,
-                renamesTitle: renamesTitle,
-                offers: ConsoleAgentRowOffers(
-                    capabilities: capabilities, supportsMultipleWindows: supportsMultipleWindows),
-                newAgentOrigin: origin)
+
+        return card.rows.map { placed in
+            let geometry = ConsoleWorkspaceRowKey.PlacedGeometry(
+                id: placed.id,
+                rule: placed.rule,
+                isFirst: placed.isFirst,
+                isLast: placed.isLast,
+                followsHeader: placed.followsHeader)
+            let reveal = foldReveal(placed, in: card)
+            let foldState = ConsoleWorkspaceRowKey.FoldState(
+                isLeaving: reveal.isLeaving,
+                isRevealing: reveal.isRevealing,
+                delay: reveal.delay)
+
+            switch placed.row {
+            case .header:
+                let primary = card.primary
+                let title = card.isRepository ? primary.checkout?.repoName ?? primary.title : primary.title
+                let subtitle = [primary.hostName, primary.pathText].compactMap { $0 }.joined(separator: " · ")
+                return ConsoleWorkspaceRowKey(
+                    pass: pass,
+                    placed: placed,
+                    card: card,
+                    geometry: geometry,
+                    foldState: foldState,
+                    slice: .header(
+                        title: title,
+                        subtitle: subtitle,
+                        agentCount: card.agents.count,
+                        isCollapsed: card.isCollapsed,
+                        accessibilityValue: card.accessibilityValue,
+                        checkouts: summarySlicesForCollapsed),
+                    collapsedSummaries: summariesForCollapsed ?? [])
+            case .summary:
+                let summaries = summariesForCollapsed ?? (card.isRepository ? checkoutSummaries(card) : [])
+                let slices = summariesForCollapsed != nil
+                    ? summarySlicesForCollapsed
+                    : summaries.map { summary in
+                        ConsoleWorkspaceRowKey.CheckoutSummarySlice(
+                            id: summary.id,
+                            title: summary.title,
+                            checkout: summary.checkout,
+                            statuses: summary.agents.map(\.agent.status),
+                            accessibilityText: summary.accessibilityText)
+                    }
+                return ConsoleWorkspaceRowKey(
+                    pass: pass,
+                    placed: placed,
+                    card: card,
+                    geometry: geometry,
+                    foldState: foldState,
+                    slice: .summary(
+                        statusItems: ConsoleHostAgentStatusCounts(agents: card.agents).items,
+                        checkouts: slices),
+                    collapsedSummaries: summaries)
+            case .checkout(let section):
+                let title = checkoutTitle(section)
+                return ConsoleWorkspaceRowKey(
+                    pass: pass,
+                    placed: placed,
+                    card: card,
+                    geometry: geometry,
+                    foldState: foldState,
+                    slice: .checkout(
+                        sectionID: section.id,
+                        isNested: section.isNested,
+                        isCollapsed: section.isCollapsed,
+                        checkout: section.checkout,
+                        title: title,
+                        agentCount: section.agents.count,
+                        collapsedStatuses: section.isCollapsed ? section.agents.map(\.agent.status) : [],
+                        accessibilityValue: section.isNested
+                            ? section.accessibilityValue
+                            : (section.agents.count == 1 ? "1 Agent" : "\(section.agents.count) Agents")),
+                    resolvedCheckoutTitle: title)
+            case .agent(let agent, let section, let standsAlone):
+                let layout = layouts[agent.hostID] ?? {
+                    let resolved = console.rowLayout(for: agent.hostID)
+                    layouts[agent.hostID] = resolved
+                    return resolved
+                }()
+                let capabilities = capabilitiesByHost[agent.hostID] ?? {
+                    let resolved = console.capabilities(for: agent.hostID)
+                    capabilitiesByHost[agent.hostID] = resolved
+                    return resolved
+                }()
+                let savedEntry = saved[agent.id]
+                let origin = savedEntry == nil && capabilities.startsAgents
+                    ? StartAgentStore.LaunchOrigin(beside: agent, in: console) : nil
+                let renamesTitle =
+                    capabilities.renameAgent
+                    && ChatProgram(rawValue: agent.agent.kind).map(AgentTitleNaming.supportsRename) == true
+                let showsHost = standsAlone && !card.isRepository
+                let hiddenTokens = ConsoleWorkspaceCard.hiddenTokens(
+                    for: agent, checkoutPath: section.checkout?.checkoutPath, showsHost: showsHost)
+                let presentation = AgentCardPresentation(
+                    agent: agent, layout: layout, hiding: hiddenTokens, leadsWithMark: true)
+                let display = makeAgentRowDisplay(agent, presentation: presentation)
+                let headingTitle = standsAlone
+                    ? (card.isRepository ? checkoutTitle(section) : ConsoleCheckoutTitle(title: section.title))
+                    : nil
+                let isPinned = console.pins.isPinned(hostID: agent.hostID, paneID: agent.agent.paneID)
+                let isSelected = selectedAgentID == agent.id
+                let offers = ConsoleAgentRowOffers(
+                    capabilities: capabilities, supportsMultipleWindows: supportsMultipleWindows)
+                return ConsoleWorkspaceRowKey(
+                    pass: pass,
+                    placed: placed,
+                    card: card,
+                    geometry: geometry,
+                    foldState: foldState,
+                    slice: .agent(
+                        display: display,
+                        standsAlone: standsAlone,
+                        isRepository: card.isRepository,
+                        headingTitle: headingTitle,
+                        sectionCheckout: section.checkout,
+                        qualifier: standsAlone ? nil : qualifiers[agent.id],
+                        saved: savedEntry,
+                        rowGap: layout.rowGap,
+                        isPinned: isPinned,
+                        isSelected: isSelected,
+                        isShownInWindow: isSelected,
+                        renamesTitle: renamesTitle,
+                        offers: offers,
+                        newAgentOrigin: origin),
+                    resolvedCheckoutTitle: headingTitle,
+                    agentPresentation: presentation,
+                    qualifier: qualifiers[agent.id],
+                    saved: savedEntry,
+                    layout: layout,
+                    isPinned: isPinned,
+                    isSelected: isSelected,
+                    isShownInWindow: isSelected,
+                    renamesTitle: renamesTitle,
+                    offers: offers,
+                    newAgentOrigin: origin)
+            }
         }
     }
 
     @ViewBuilder
     private func workspaceCardRow(_ key: ConsoleWorkspaceRowKey) -> some View {
+        let _ = PerfTrace.count("ConsoleView.workspaceRow")
         let placed = key.placed
         let card = key.card
+        let reveal = ConsoleFoldReveal(
+            isLeaving: key.foldState.isLeaving,
+            isRevealing: key.foldState.isRevealing,
+            delay: key.foldState.delay)
         switch placed.row {
         case .header:
             let primary = card.primary
@@ -2088,7 +2465,7 @@ struct ConsoleView: View {
             ConsoleWorkspaceCardHeader(
                 card: card, title: title,
                 subtitle: [primary.hostName, primary.pathText].compactMap { $0 }.joined(separator: " · "),
-                checkouts: card.isRepository && card.isCollapsed ? checkoutSummaries(card) : [],
+                checkouts: key.collapsedSummaries,
                 onToggle: { toggleWorkspaceSection(primary.id) }
             )
             .modifier(ConsoleWorkspaceCardRow(placed: placed, indent: .icon, top: 8, bottom: 4))
@@ -2096,20 +2473,20 @@ struct ConsoleView: View {
         case .summary:
             ConsoleWorkspaceCardSummary(
                 card: card,
-                checkouts: card.isRepository ? checkoutSummaries(card) : [],
+                checkouts: key.collapsedSummaries,
                 onToggle: { toggleWorkspaceSection(card.primary.id) }
             )
-            .modifier(foldReveal(placed, in: card))
+            .modifier(reveal)
             .modifier(
                 ConsoleWorkspaceCardRow(
                     placed: placed, indent: .text, top: 0, bottom: 6, fillsShortestRow: false))
             .selectionDisabled()
         case .checkout(let section):
             ConsoleCheckoutHeader(
-                section: section, title: checkoutTitle(section),
+                section: section, title: key.resolvedCheckoutTitle ?? checkoutTitle(section),
                 onToggle: section.isNested ? { toggleWorkspaceSection(section.id) } : nil
             )
-            .modifier(foldReveal(placed, in: card))
+            .modifier(reveal)
             .modifier(ConsoleWorkspaceCardRow(placed: placed, indent: .icon, top: 0, bottom: 0))
             .selectionDisabled()
         case .agent(let agent, let section, let standsAlone):
@@ -2133,13 +2510,19 @@ struct ConsoleView: View {
                 cardAgentLabel(
                     agent, of: section, standsAlone: standsAlone, in: card,
                     layout: layout, isPinned: key.isPinned,
-                    qualifier: key.qualifier, saved: key.saved, readsChanges: true)
-                .modifier(foldReveal(placed, in: card))
+                    qualifier: key.qualifier, saved: key.saved,
+                    headingTitle: key.resolvedCheckoutTitle,
+                    precomputedPresentation: key.agentPresentation,
+                    readsChanges: true)
+                .modifier(reveal)
             } preview: {
                 cardAgentLabel(
                     agent, of: section, standsAlone: standsAlone, in: card,
                     layout: layout, isPinned: key.isPinned,
-                    qualifier: key.qualifier, saved: key.saved, readsChanges: false)
+                    qualifier: key.qualifier, saved: key.saved,
+                    headingTitle: key.resolvedCheckoutTitle,
+                    precomputedPresentation: key.agentPresentation,
+                    readsChanges: false)
             }
         }
     }
@@ -2150,12 +2533,16 @@ struct ConsoleView: View {
     private func cardAgentLabel(
         _ agent: ConsoleAgent, of section: ConsoleWorkspaceSection, standsAlone: Bool,
         in card: ConsoleWorkspaceCard, layout: AgentRowLayout, isPinned: Bool,
-        qualifier: String?, saved: HostReadiness?, readsChanges: Bool
+        qualifier: String?, saved: HostReadiness?,
+        headingTitle: ConsoleCheckoutTitle? = nil,
+        precomputedPresentation: AgentCardPresentation? = nil,
+        readsChanges: Bool
     ) -> some View {
         let showsHost = standsAlone && !card.isRepository
         let heading = standsAlone
             ? AgentCardHeading(
-                title: card.isRepository ? checkoutTitle(section) : ConsoleCheckoutTitle(title: section.title),
+                title: headingTitle
+                    ?? (card.isRepository ? checkoutTitle(section) : ConsoleCheckoutTitle(title: section.title)),
                 isProminent: !card.isRepository,
                 systemImage: ConsoleWorkspaceCardIcon.systemName(for: section.checkout))
             : nil
@@ -2170,22 +2557,19 @@ struct ConsoleView: View {
                 for: agent, checkoutPath: section.checkout?.checkoutPath, showsHost: showsHost),
             heading: heading,
             showsHost: showsHost,
-            lead: .card)
+            lead: .card,
+            precomputedPresentation: precomputedPresentation)
     }
 
     /// A repository's checkout, titled by the branch its Agents' latest
     /// Changes reads found, or before any did, the branch saved from the
     /// last read.
     private func checkoutTitle(_ section: ConsoleWorkspaceSection) -> ConsoleCheckoutTitle {
-        let reads = section.agents.compactMap { agent -> CheckoutChanges? in
-            guard case .loaded(let changes) = console.rowChanges.store(for: agent)?.phase else { return nil }
-            return changes
-        }
         let path = section.checkout?.checkoutPath
         return ConsoleCheckoutTitle(
             label: section.title,
             isMainCheckout: section.checkout?.isLinkedWorktree != true,
-            branch: ConsoleCheckoutTitle.branch(at: path, in: reads)
+            branch: console.rowChanges.branch(at: path, for: section.agents)
                 ?? console.savedBranch(on: section.id.hostID, atCheckoutPath: path))
     }
 
@@ -2269,7 +2653,7 @@ struct ConsoleView: View {
         let hasExpandedAgents = sections.contains { !$0.isCollapsed && !$0.agents.isEmpty }
         let qualifiers = hasExpandedAgents ? agentTitleQualifiers : [:]
         let saved = console.savedChatEntries
-        let pass = contentPass.number
+        let pass = rowBuilderPass
         ForEach(sections) { @Sendable section in
             MainActorContent {
                 // A Host with several Servers expands whatever one of them
@@ -2323,17 +2707,23 @@ struct ConsoleView: View {
                 isPinned: key.isPinned,
                 changes: console.rowChanges.store(for: key.agent),
                 qualifier: key.qualifier,
-                saved: key.saved)
+                saved: key.saved,
+                precomputedPresentation: key.display.presentation)
         } preview: {
             AgentCardView(
                 agent: key.agent,
                 layout: key.layout,
                 isPinned: key.isPinned,
                 qualifier: key.qualifier,
-                saved: key.saved)
+                saved: key.saved,
+                precomputedPresentation: key.display.presentation)
         }
         .listRowSeparator(.hidden)
         .modifier(ListRowVerticalInsets(4))
+    }
+
+    private func currentAgent(_ fallback: ConsoleAgent) -> ConsoleAgent {
+        console.chatDisplayAgents.first { $0.id == fallback.id } ?? fallback
     }
 
     /// An Agent's row: `label` opens its detail, with the row's pin, close,
@@ -2353,10 +2743,10 @@ struct ConsoleView: View {
         }
         // The list reads what it shows: a row on screen reads its Agent's
         // Checkout, and an exit from Working while none does waits for one.
-        .onAppear { console.rowChanges.rowAppeared(agent) }
+        .onAppear { console.rowChanges.rowAppeared(currentAgent(agent)) }
         .onDisappear { console.rowChanges.rowDisappeared(agent.id) }
         .onChange(of: agent.directory == nil) { _, lacksDirectory in
-            if !lacksDirectory { console.rowChanges.agentReportedDirectory(agent) }
+            if !lacksDirectory { console.rowChanges.agentReportedDirectory(currentAgent(agent)) }
         }
         .modifier(background)
         .hoverEffect(.highlight)
@@ -2371,30 +2761,32 @@ struct ConsoleView: View {
                 }
                 if renamesTitle {
                     Button("Rename", systemImage: "pencil") {
-                        titleRename = console.titleRenameStore(for: agent)
+                        titleRename = console.titleRenameStore(for: currentAgent(agent))
                     }
                 }
                 // Never on iPhone, and not for the Agent this window already shows.
                 if offers.opensInNewWindow, !isShownInWindow {
                     Button("Open in New Window", systemImage: "plus.rectangle.on.rectangle") {
-                        openInNewWindow(agent)
+                        openInNewWindow(currentAgent(agent))
                     }
                 }
                 // In the Agent's Workspace and directory, as its detail's
                 // New Agent starts one.
                 if let newAgentOrigin {
                     Button("New Agent", systemImage: "plus") {
-                        startAgentRequest = StartAgentRequest(origin: newAgentOrigin)
+                        let latest = currentAgent(agent)
+                        let freshOrigin = StartAgentStore.LaunchOrigin(beside: latest, in: console)
+                        startAgentRequest = StartAgentRequest(origin: freshOrigin ?? newAgentOrigin)
                     }
                 }
                 if console.offersHandOff(for: agent) {
                     Button(HandOffCopy.action, systemImage: HandOffCopy.symbol) {
-                        handOffRequest = HandOffRequest(source: agent)
+                        handOffRequest = HandOffRequest(source: currentAgent(agent))
                     }
                 }
                 if offers.moves, !isSaved {
                     Button(MovePaneCopy.action, systemImage: MovePaneCopy.symbol) {
-                        movePaneRequest = MovePaneRequest(agent: agent)
+                        movePaneRequest = MovePaneRequest(agent: currentAgent(agent))
                     }
                 }
                 if offers.copiesPaneID, !isSaved {
@@ -2405,7 +2797,7 @@ struct ConsoleView: View {
                 if isSaved {
                     Divider()
                     Button(SavedChatRemovalCopy.action, systemImage: "trash", role: .destructive) {
-                        pendingSavedChatRemoval = agent
+                        pendingSavedChatRemoval = currentAgent(agent)
                     }
                 } else if offers.closes {
                     Divider()
@@ -2413,7 +2805,7 @@ struct ConsoleView: View {
                         closeScope(for: agent).actionTitle, systemImage: "trash",
                         role: .destructive
                     ) {
-                        pendingTabClose = agent
+                        pendingTabClose = currentAgent(agent)
                     }
                 }
             } preview: {
@@ -2426,7 +2818,7 @@ struct ConsoleView: View {
                 isEnabled: offers.opensInNewWindow))
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             Button {
-                togglePinAfterSwipe(agent)
+                togglePinAfterSwipe(currentAgent(agent))
             } label: {
                 Label(
                     isPinned ? "Unpin" : "Pin",
@@ -2440,10 +2832,11 @@ struct ConsoleView: View {
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             if isSaved || offers.closes {
                 Button {
+                    let latest = currentAgent(agent)
                     if isSaved {
-                        pendingSavedChatRemoval = agent
+                        pendingSavedChatRemoval = latest
                     } else {
-                        pendingTabClose = agent
+                        pendingTabClose = latest
                     }
                 } label: {
                     Label(isSaved ? SavedChatRemovalCopy.confirm : String(localized: "Close"), systemImage: "trash")
@@ -2579,30 +2972,46 @@ struct ConsoleView: View {
     }
 
     private var hostSections: [ConsoleHostSection] {
-        PerfTrace.span("console.list.host-sections") {
-            listPresentation.sections(
-                hosts: hosts.consoleHosts,
-                console: console,
-                filteredHostIDs: hostFilter,
-                searchQuery: agentSearchText)
-        }
+        listPresentation.sectionsWithVisibleIDs(
+            hosts: hosts.consoleHosts,
+            console: console,
+            filteredHostIDs: hostFilter,
+            searchQuery: agentSearchText
+        ).sections
     }
 
     private var workspaceCards: [ConsoleWorkspaceCard] {
-        PerfTrace.span("console.list.workspace-cards") {
-            ConsoleWorkspaceCard.cards(
-                listPresentation.workspaceSections(
-                    hosts: hosts.consoleHosts, console: console,
-                    filteredHostIDs: hostFilter, searchQuery: agentSearchText))
-        }
+        listPresentation.workspaceCardsWithVisibleIDs(
+            hosts: hosts.consoleHosts,
+            console: console,
+            filteredHostIDs: hostFilter,
+            searchQuery: agentSearchText
+        ).cards
     }
 
     /// Where previous and next can land.
     private var visibleAgentIDs: [ConsoleAgent.ID] {
         switch listPresentation.mode {
-        case .flat: filteredAgents.map(\.id)
-        case .grouped: hostSections.filter { !$0.isCollapsed }.flatMap { $0.agents.map(\.id) }
-        case .byWorkspace: workspaceCards.flatMap(\.visibleAgentIDs)
+        case .flat:
+            listPresentation.filteredAgentSlice(
+                in: console,
+                filteredHostIDs: hostFilter,
+                searchQuery: agentSearchText
+            ).filteredIDs
+        case .grouped:
+            listPresentation.sectionsWithVisibleIDs(
+                hosts: hosts.consoleHosts,
+                console: console,
+                filteredHostIDs: hostFilter,
+                searchQuery: agentSearchText
+            ).visibleAgentIDs
+        case .byWorkspace:
+            listPresentation.workspaceCardsWithVisibleIDs(
+                hosts: hosts.consoleHosts,
+                console: console,
+                filteredHostIDs: hostFilter,
+                searchQuery: agentSearchText
+            ).visibleAgentIDs
         }
     }
 
@@ -2629,26 +3038,29 @@ struct ConsoleView: View {
     }
 
     private var hostFilteredAgents: [ConsoleAgent] {
-        guard !hostFilter.isEmpty else { return console.chatDisplayAgents }
-        return console.chatDisplayAgents.filter { hostFilter.contains($0.hostID) }
+        listPresentation.filteredAgentSlice(
+            in: console,
+            filteredHostIDs: hostFilter,
+            searchQuery: agentSearchText
+        ).hostFiltered
     }
 
     /// After the Host filter and the search, before the status filter: what
     /// the status menu counts.
     private var searchedAgents: [ConsoleAgent] {
-        let hostFiltered = hostFilteredAgents
-        let needle = agentSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return hostFiltered }
-        return hostFiltered.filter { $0.matchesAgentSearch(needle) }
+        listPresentation.filteredAgentSlice(
+            in: console,
+            filteredHostIDs: hostFilter,
+            searchQuery: agentSearchText
+        ).searched
     }
 
     private var filteredAgents: [ConsoleAgent] {
-        PerfTrace.span("console.list.filtered-agents") {
-            let statusFilter = listPresentation.statusFilter
-            let searched = searchedAgents
-            guard !statusFilter.isEmpty else { return searched }
-            return searched.filter { statusFilter.admits($0) }
-        }
+        listPresentation.filteredAgentSlice(
+            in: console,
+            filteredHostIDs: hostFilter,
+            searchQuery: agentSearchText
+        ).filtered
     }
 
     private var statusFilterCounts: [ConsoleAgentStatusFilter: Int] {
@@ -2662,26 +3074,13 @@ struct ConsoleView: View {
     private var agentTitleQualifiers: [ConsoleAgent.ID: String] {
         let span = PerfTrace.begin("console.list.title-qualifiers")
         defer { PerfTrace.end(span) }
-        // By Workspace rows leave fields to their card's titles.
         let isByWorkspace = listPresentation.mode == .byWorkspace
         let savedStructures = isByWorkspace ? console.savedWorkspaceStructures : [:]
-        var layouts: [Host.ID: AgentRowLayout] = [:]
-        return AgentTitleQualifier.qualifiers(for: hostFilteredAgents) { agent in
-            let layout = layouts[agent.hostID] ?? {
-                let resolved = console.rowLayout(for: agent.hostID)
-                layouts[agent.hostID] = resolved
-                return resolved
-            }()
-            let checkoutPath = agent.checkoutPath
-                ?? savedStructures[agent.hostID]?.first { $0.id == agent.agent.workspaceID }?.checkout.checkoutPath
-            let card = AgentCardPresentation(
-                agent: agent, layout: layout,
-                hiding: isByWorkspace
-                    ? ConsoleWorkspaceCard.hiddenTokens(for: agent, checkoutPath: checkoutPath, showsHost: false)
-                    : [],
-                leadsWithMark: true)
-            return .init(title: card.headline, namesAgent: card.cardNamesAgent)
-        }
+        return listPresentation.titleQualifiers(
+            for: hostFilteredAgents,
+            isByWorkspace: isByWorkspace,
+            savedStructures: savedStructures,
+            rowLayout: { console.rowLayout(for: $0) })
     }
 
     /// Host issues shown in the list: all of them, or the selected Hosts'
@@ -2764,9 +3163,18 @@ struct ConsoleView: View {
         var showsSetupGuide = false
         /// Opens the Host's Host Helper sheet over its page.
         var opensHostHelper = false
+        /// Opens Settings on the Hosts tab's stack, where it has no tab.
+        var showsSettings = false
         /// The tab the Host was opened from; its back button returns there.
         /// Nil when opened from the Hosts tab itself.
         let origin: ConsoleTab?
+    }
+
+    /// One of the Console's own sheets, other than a GitHub write's, is up.
+    private var isConsoleSheetUp: Bool {
+        titleRename != nil || movePaneRequest != nil || handOffRequest != nil || gitHubSendRequest != nil
+            || startAgentRequest != nil || isStartingTerminal || connectionDetailRequest != nil
+            || isShowingHostIssues || isShowingHostsSheet || isShowingSettingsSheet
     }
 
     /// How the Console's sheets present, resolved against this view.
@@ -3135,7 +3543,7 @@ private struct SidebarListMenu: View {
                 // gives way to one over the bar item's whole frame.
                 .contentShape(.hoverEffect, Capsule().inset(by: 4))
                 .hoverEffect(.highlight)
-                .accessibilityHint("Switches between Agents, Terminals and Usage")
+                .accessibilityHint("Switches to another list")
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
                     frame = $0
                 }
@@ -3150,6 +3558,8 @@ private struct SidebarListChoices: View {
     let lists: [ConsoleTab]
     @Binding var isPresented: Bool
     let select: (ConsoleTab) -> Void
+    /// The symbols' column, which grows with the text beside it.
+    @ScaledMetric(relativeTo: .body) private var symbolWidth: CGFloat = 24
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -3165,7 +3575,7 @@ private struct SidebarListChoices: View {
                                 .opacity(list == shown ? 1 : 0)
                                 .accessibilityHidden(true)
                             Image(systemName: Self.symbol(for: list))
-                                .frame(width: 24)
+                                .frame(width: symbolWidth)
                                 .accessibilityHidden(true)
                             Text(list.title)
                             Spacer(minLength: 0)
@@ -3181,13 +3591,16 @@ private struct SidebarListChoices: View {
             }
         }
         .padding(.vertical, 6)
-        .frame(width: 220)
+        // A menu's width, and wider as the text grows, so a list's name
+        // stays on one line instead of breaking inside the word.
+        .frame(minWidth: 220)
         .presentationCompactAdaptation(.popover)
     }
 
     private static func symbol(for list: ConsoleTab) -> String {
         switch list {
         case .terminals: "terminal"
+        case .github: ConsoleTab.gitHubSymbol
         case .usage: "chart.bar.xaxis"
         default: "sparkles"
         }
@@ -3238,6 +3651,7 @@ private struct SidebarListShown: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .environment(\.isSidebarListShown, isShown)
             .opacity(isShown ? 1 : 0)
             .allowsHitTesting(isShown)
             .disabled(!isShown)
@@ -3557,6 +3971,8 @@ private struct ConsoleNoticesAndResets: ViewModifier {
     let savedChatRemovalMessage: (ConsoleAgent) -> String
     let removeSavedChat: (ConsoleAgent) -> Void
     let leaveUsage: () -> Void
+    let leaveGitHub: () -> Void
+    let moveSettings: (_ underHosts: Bool) -> Void
 
     func body(content: Content) -> some View {
         content
@@ -3572,7 +3988,9 @@ private struct ConsoleNoticesAndResets: ViewModifier {
                 pending: $pendingSavedChatRemoval,
                 message: savedChatRemovalMessage,
                 remove: removeSavedChat))
-            .modifier(UsageTurnedOffReset(isEnabled: console.isUsageEnabled, reset: leaveUsage))
+            .modifier(ConsoleTabSwitchResets(
+                isUsageEnabled: console.isUsageEnabled, isGitHubEnabled: console.isGitHubEnabled,
+                leaveUsage: leaveUsage, leaveGitHub: leaveGitHub, moveSettings: moveSettings))
     }
 }
 
@@ -3640,14 +4058,65 @@ private struct ConsoleHostIssuePresentationReset: ViewModifier {
     }
 }
 
-private struct UsageTurnedOffReset: ViewModifier {
-    let isEnabled: Bool
-    let reset: () -> Void
+private struct ConsoleTabSwitchResets: ViewModifier {
+    let isUsageEnabled: Bool
+    let isGitHubEnabled: Bool
+    let leaveUsage: () -> Void
+    let leaveGitHub: () -> Void
+    let moveSettings: (_ underHosts: Bool) -> Void
 
     func body(content: Content) -> some View {
-        content.onChange(of: isEnabled) { _, enabled in
-            if !enabled { reset() }
-        }
+        content
+            .onChange(of: isUsageEnabled) { _, enabled in
+                if !enabled { leaveUsage() }
+            }
+            .onChange(of: isGitHubEnabled) { _, enabled in
+                if !enabled { leaveGitHub() }
+            }
+            // With both on, Settings leaves the tab bar for the Hosts tab.
+            .onChange(of: isUsageEnabled && isGitHubEnabled) { _, underHosts in
+                moveSettings(underHosts)
+            }
+    }
+}
+
+/// A Usage or GitHub sidebar's chrome beside an iPad's sidebar: the title
+/// that switches lists, its choices, and the Hosts and Settings foot.
+private struct SidebarListChrome<Footer: View>: ViewModifier {
+    let shown: ConsoleTab
+    let lists: [ConsoleTab]
+    @Binding var isPresented: Bool
+    @Binding var titleFrame: CGRect?
+    let select: (ConsoleTab) -> Void
+    let footer: Footer
+
+    func body(content: Content) -> some View {
+        content
+            .navigationTitle(shown.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    SidebarListMenu(shown: shown, lists: lists, isPresented: $isPresented, frame: $titleFrame)
+                }
+                .toolbarItemBackground(.hidden)
+            }
+            .toolbar(removing: .title)
+            .toolbar(removing: .sidebarToggle)
+            .bottomBar { footer }
+            .overlay {
+                GeometryReader { proxy in
+                    let anchor = SidebarListMenu.anchor(under: titleFrame, in: proxy.frame(in: .global))
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .popover(isPresented: $isPresented, arrowEdge: .top) {
+                            SidebarListChoices(
+                                shown: shown, lists: lists, isPresented: $isPresented, select: select)
+                        }
+                        .position(anchor)
+                }
+                .ignoresSafeArea(.container, edges: .top)
+                .allowsHitTesting(false)
+            }
     }
 }
 
@@ -3834,10 +4303,130 @@ private struct ConsoleAgentListStyle: ViewModifier {
     }
 }
 
+private struct ConsoleAgentListScrollFreeze: ViewModifier {
+    let presentation: ConsoleListPresentationStore
+    let rowChanges: AgentRowChanges
+    let mode: ConsoleListPresentationMode
+
+    private nonisolated static func scrollPosition(for geometry: ScrollGeometry) -> ConsoleListScrollPosition {
+        let offsetFromTop = geometry.contentOffset.y + geometry.contentInsets.top
+        let maxOffsetFromTop = max(
+            0,
+            geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
+                - geometry.containerSize.height)
+        return ConsoleListScrollPosition(
+            offsetFromTop: offsetFromTop,
+            maxOffsetFromTop: maxOffsetFromTop)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .onScrollPhaseChange { _, newPhase, context in
+                let active = newPhase.isScrolling
+                rowChanges.setScrollActive(active)
+                let position = Self.scrollPosition(for: context.geometry)
+                if active {
+                    presentation.setScrollActive(true, userInitiated: newPhase == .interacting)
+                    presentation.updateScrollPosition(position)
+                } else {
+                    presentation.updateScrollPosition(position)
+                    presentation.setScrollActive(false)
+                }
+            }
+            .onScrollGeometryChange(for: ConsoleListScrollPosition.self) { geometry in
+                Self.scrollPosition(for: geometry)
+            } action: { _, position in
+                presentation.updateScrollPosition(position)
+            }
+            .onDisappear {
+                rowChanges.setScrollActive(false)
+                presentation.resetScrollTracking()
+            }
+            .onChange(of: mode) { _, _ in
+                rowChanges.setScrollActive(false)
+                presentation.resetScrollTracking()
+            }
+    }
+}
+
+private struct ConsoleRowBuilderStamp: Equatable {
+    let console: ObjectIdentifier
+    let hosts: ObjectIdentifier
+    let horizontalSizeClass: UserInterfaceSizeClass?
+    let colorScheme: ColorScheme
+    let reduceMotion: Bool
+    let dynamicTypeSize: DynamicTypeSize
+    let supportsMultipleWindows: Bool
+    let hasSceneRouting: Bool
+}
+
+private struct ConsoleDetailBuilderStamp: Equatable {
+    let console: ObjectIdentifier
+    let hosts: ObjectIdentifier
+    let terminalThemes: ObjectIdentifier
+    let inputMode: ObjectIdentifier
+    let detailSurface: ObjectIdentifier
+    let activity: ObjectIdentifier
+    let currentTab: ConsoleTab
+    let horizontalSizeClass: UserInterfaceSizeClass?
+    let colorScheme: ColorScheme
+    let themeAppearance: ColorScheme
+    let reduceMotion: Bool
+    let dynamicTypeSize: DynamicTypeSize
+    let scenePhase: ScenePhase
+    let supportsMultipleWindows: Bool
+    let hasSceneRouting: Bool
+    let shellRoute: AgentShellRoute?
+}
+
+@MainActor
+private final class ConsolePassTracker {
+    private var lastRowStamp: ConsoleRowBuilderStamp?
+    private var rowGeneration = 0
+    private var lastDetailStamp: ConsoleDetailBuilderStamp?
+    private var detailGeneration = 0
+
+    func rowPass(for stamp: ConsoleRowBuilderStamp) -> Int {
+        if lastRowStamp != stamp {
+            lastRowStamp = stamp
+            rowGeneration &+= 1
+        }
+        return rowGeneration
+    }
+
+    func detailPass(for stamp: ConsoleDetailBuilderStamp) -> Int {
+        if lastDetailStamp != stamp {
+            lastDetailStamp = stamp
+            detailGeneration &+= 1
+        }
+        return detailGeneration
+    }
+}
+
+struct ConsoleAgentRowDisplay: Equatable, Sendable {
+    let id: ConsoleAgent.ID
+    let terminalID: String
+    let kind: String
+    let displayName: String
+    let status: AgentStatus
+    let hostName: String
+    let workspaceID: String
+    let workspaceLabel: String?
+    let directory: String?
+    let cwd: String
+    let checkout: RepositoryCheckout?
+    let presentation: AgentCardPresentation
+    let offersHandOff: Bool
+    let closeActionTitle: String
+}
+
 /// What the Agents list hands an Agent row's builder; see `KeyedContent`.
-private struct ConsoleAgentRowKey: Equatable, Sendable {
+/// Equality compares only UI-rendered and action-relevant fields rather than
+/// wire `revision` or `stateChangeSeq`.
+struct ConsoleAgentRowKey: Equatable, Sendable {
     let pass: Int
     let agent: ConsoleAgent
+    let display: ConsoleAgentRowDisplay
     let qualifier: String?
     let saved: HostReadiness?
     let layout: AgentRowLayout
@@ -3846,6 +4435,58 @@ private struct ConsoleAgentRowKey: Equatable, Sendable {
     let isShownInWindow: Bool
     let renamesTitle: Bool
     let offers: ConsoleAgentRowOffers
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.pass == rhs.pass
+            && lhs.display == rhs.display
+            && lhs.qualifier == rhs.qualifier
+            && lhs.saved == rhs.saved
+            && lhs.layout.rowGap == rhs.layout.rowGap
+            && lhs.isPinned == rhs.isPinned
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isShownInWindow == rhs.isShownInWindow
+            && lhs.renamesTitle == rhs.renamesTitle
+            && lhs.offers == rhs.offers
+    }
+
+    static func makeForTesting(
+        _ agent: ConsoleAgent,
+        pass: Int = 1,
+        layout: AgentRowLayout = .consoleDefault,
+        qualifier: String? = nil,
+        isPinned: Bool = false,
+        isSelected: Bool = false
+    ) -> Self {
+        let presentation = AgentCardPresentation(
+            agent: agent, layout: layout, hiding: [], leadsWithMark: true)
+        let display = ConsoleAgentRowDisplay(
+            id: agent.id,
+            terminalID: agent.agent.terminalID,
+            kind: agent.agent.kind,
+            displayName: agent.agent.displayName,
+            status: agent.agent.status,
+            hostName: agent.hostName,
+            workspaceID: agent.agent.workspaceID,
+            workspaceLabel: agent.workspaceLabel,
+            directory: agent.directory,
+            cwd: agent.agent.cwd,
+            checkout: agent.repositoryCheckout,
+            presentation: presentation,
+            offersHandOff: false,
+            closeActionTitle: TerminalCloseScope.tab.actionTitle)
+        return Self(
+            pass: pass,
+            agent: agent,
+            display: display,
+            qualifier: qualifier,
+            saved: nil,
+            layout: layout,
+            isPinned: isPinned,
+            isSelected: isSelected,
+            isShownInWindow: isSelected,
+            renamesTitle: false,
+            offers: ConsoleAgentRowOffers(opensInNewWindow: false, closes: true))
+    }
 }
 
 /// What the detail column hands an Agent's detail.
@@ -3859,12 +4500,78 @@ private struct ConsoleAgentDetailKey: Equatable, Sendable {
     let opening: Int
 }
 
-/// What By Workspace hands a card row's builder. A row reads its card, so
-/// it follows every change to the card's Agents.
-private struct ConsoleWorkspaceRowKey: Equatable, Sendable {
+/// What By Workspace hands a card row's builder. Equality compares only the
+/// slice rendered by this single row rather than the whole card or sibling
+/// Agents, so one Agent changing status never invalidates its siblings.
+struct ConsoleWorkspaceRowKey: Equatable, Sendable {
+    struct PlacedGeometry: Equatable, Sendable {
+        let id: ConsoleWorkspaceCard.Placed.ID
+        let rule: ConsoleWorkspaceCard.Rule
+        let isFirst: Bool
+        let isLast: Bool
+        let followsHeader: Bool
+    }
+
+    struct FoldState: Equatable, Sendable {
+        let isLeaving: Bool
+        let isRevealing: Bool
+        let delay: Double
+    }
+
+    struct CheckoutSummarySlice: Equatable, Sendable {
+        let id: ConsoleWorkspaceSection.ID
+        let title: ConsoleCheckoutTitle
+        let checkout: RepositoryCheckout?
+        let statuses: [AgentStatus]
+        let accessibilityText: String
+    }
+
+    fileprivate enum Slice: Equatable, Sendable {
+        case header(
+            title: String,
+            subtitle: String,
+            agentCount: Int,
+            isCollapsed: Bool,
+            accessibilityValue: String,
+            checkouts: [CheckoutSummarySlice])
+        case summary(
+            statusItems: [ConsoleHostAgentStatusCount],
+            checkouts: [CheckoutSummarySlice])
+        case checkout(
+            sectionID: ConsoleWorkspaceSection.ID,
+            isNested: Bool,
+            isCollapsed: Bool,
+            checkout: RepositoryCheckout?,
+            title: ConsoleCheckoutTitle,
+            agentCount: Int,
+            collapsedStatuses: [AgentStatus],
+            accessibilityValue: String)
+        case agent(
+            display: ConsoleAgentRowDisplay,
+            standsAlone: Bool,
+            isRepository: Bool,
+            headingTitle: ConsoleCheckoutTitle?,
+            sectionCheckout: RepositoryCheckout?,
+            qualifier: String?,
+            saved: HostReadiness?,
+            rowGap: Int,
+            isPinned: Bool,
+            isSelected: Bool,
+            isShownInWindow: Bool,
+            renamesTitle: Bool,
+            offers: ConsoleAgentRowOffers,
+            newAgentOrigin: StartAgentStore.LaunchOrigin?)
+    }
+
     let pass: Int
     let placed: ConsoleWorkspaceCard.Placed
     let card: ConsoleWorkspaceCard
+    let geometry: PlacedGeometry
+    let foldState: FoldState
+    fileprivate let slice: Slice
+    var collapsedSummaries: [ConsoleCheckoutSummary] = []
+    var resolvedCheckoutTitle: ConsoleCheckoutTitle?
+    var agentPresentation: AgentCardPresentation?
     var qualifier: String?
     var saved: HostReadiness?
     var layout: AgentRowLayout?
@@ -3874,6 +4581,77 @@ private struct ConsoleWorkspaceRowKey: Equatable, Sendable {
     var renamesTitle = false
     var offers: ConsoleAgentRowOffers?
     var newAgentOrigin: StartAgentStore.LaunchOrigin?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.pass == rhs.pass
+            && lhs.geometry == rhs.geometry
+            && lhs.foldState == rhs.foldState
+            && lhs.slice == rhs.slice
+    }
+
+    static func makeAgentKeysForTesting(
+        in card: ConsoleWorkspaceCard,
+        pass: Int = 1,
+        layout: AgentRowLayout = .consoleDefault
+    ) -> [ConsoleAgent.ID: Self] {
+        var result: [ConsoleAgent.ID: Self] = [:]
+        for placed in card.rows {
+            guard case .agent(let agent, let section, let standsAlone) = placed.row else { continue }
+            let showsHost = standsAlone && !card.isRepository
+            let hiddenTokens = ConsoleWorkspaceCard.hiddenTokens(
+                for: agent, checkoutPath: section.checkout?.checkoutPath, showsHost: showsHost)
+            let presentation = AgentCardPresentation(
+                agent: agent, layout: layout, hiding: hiddenTokens, leadsWithMark: true)
+            let display = ConsoleAgentRowDisplay(
+                id: agent.id,
+                terminalID: agent.agent.terminalID,
+                kind: agent.agent.kind,
+                displayName: agent.agent.displayName,
+                status: agent.agent.status,
+                hostName: agent.hostName,
+                workspaceID: agent.agent.workspaceID,
+                workspaceLabel: agent.workspaceLabel,
+                directory: agent.directory,
+                cwd: agent.agent.cwd,
+                checkout: agent.repositoryCheckout,
+                presentation: presentation,
+                offersHandOff: false,
+                closeActionTitle: TerminalCloseScope.tab.actionTitle)
+            let headingTitle = standsAlone ? ConsoleCheckoutTitle(title: section.title) : nil
+            let offers = ConsoleAgentRowOffers(opensInNewWindow: false, closes: true)
+            result[agent.id] = Self(
+                pass: pass,
+                placed: placed,
+                card: card,
+                geometry: PlacedGeometry(
+                    id: placed.id,
+                    rule: placed.rule,
+                    isFirst: placed.isFirst,
+                    isLast: placed.isLast,
+                    followsHeader: placed.followsHeader),
+                foldState: FoldState(isLeaving: false, isRevealing: false, delay: 0),
+                slice: .agent(
+                    display: display,
+                    standsAlone: standsAlone,
+                    isRepository: card.isRepository,
+                    headingTitle: headingTitle,
+                    sectionCheckout: section.checkout,
+                    qualifier: nil,
+                    saved: nil,
+                    rowGap: layout.rowGap,
+                    isPinned: false,
+                    isSelected: false,
+                    isShownInWindow: false,
+                    renamesTitle: false,
+                    offers: offers,
+                    newAgentOrigin: nil),
+                resolvedCheckoutTitle: headingTitle,
+                agentPresentation: presentation,
+                layout: layout,
+                offers: offers)
+        }
+        return result
+    }
 }
 
 /// What a collapsed split view last said about going back to its list.
